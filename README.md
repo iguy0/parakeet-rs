@@ -117,7 +117,7 @@ for chunk in audio.chunks(17920) {  // ~1.12s at 16kHz
 ```
 See `examples/multitalker.rs` for full usage with latency modes.
 
-**Sortformer v2 & v2.1 (Speaker Diarization)**: Streaming 4-speaker diarization
+**Sortformer v2 & v2.1 (Speaker Diarization)**: Streaming diarization (4 speakers by default; 8-speaker Ultra exports supported via ONNX `num_speakers` metadata)
 ```toml
 parakeet-rs = { version = "0.3", features = ["sortformer"] }
 ```
@@ -134,6 +134,9 @@ for seg in segments {
     println!("Speaker {} [{:.2}s - {:.2}s]", seg.speaker_id,
         seg.start as f64 / 16_000.0, seg.end as f64 / 16_000.0);
 }
+
+// 8-speaker Ultra Sortformer: pass ONNX with num_speakers=8 metadata
+// println!("{}", sortformer.num_speakers()); // 8
 
 // For streaming/real-time use, diarize_chunk() preserves state across calls:
 let segments = sortformer.diarize_chunk(&audio_chunk_16k_mono)?;

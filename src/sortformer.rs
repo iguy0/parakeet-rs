@@ -8,7 +8,10 @@
 //! - Smart speaker cache compression (keeps important frames, not just recent)
 //! - Silence profile tracking
 //! - Post-processing: median filtering, hysteresis thresholding
-//! - Supports up to 4 speakers
+//! - Supports 4 speakers (NVIDIA v2/v2.1) or 8 speakers (Ultra-Sortformer exports)
+//!
+//! Speaker count and streaming chunk sizes are read from ONNX metadata when present
+//! (`num_speakers`, `chunk_len`, `fifo_len`, `spkcache_len`, `right_context`).
 //!
 //! Reference: https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2
 //! Note that, my ONNX export:
@@ -43,7 +46,12 @@ const SPKCACHE_LEN: usize = 188; // Speaker cache length
 const RIGHT_CONTEXT: usize = 1; // Future frames for lookahead
 const SUBSAMPLING: usize = 8; // Audio frames -> model frames
 const EMB_DIM: usize = 512; // Embedding dimension
-pub const NUM_SPEAKERS: usize = 4; // Model supports 4 speakers
+/// Default speaker count for NVIDIA 4spk Sortformer exports without ONNX metadata.
+pub const DEFAULT_NUM_SPEAKERS: usize = 4;
+
+/// Backward-compatible alias for [`DEFAULT_NUM_SPEAKERS`].
+pub const NUM_SPEAKERS: usize = DEFAULT_NUM_SPEAKERS;
+
 const FRAME_DURATION: f32 = 0.08; // 80ms per frame
 
 // Cache compression params (from NeMo)
@@ -177,7 +185,7 @@ pub struct SpeakerSegment {
 /// Used by the multitalker pipeline to derive speaker masks for the ASR encoder.
 #[derive(Debug, Clone)]
 pub struct RawDiarizationPredictions {
-    /// Per-frame speaker activity probabilities, shape [num_frames, NUM_SPEAKERS].
+    /// Per-frame speaker activity probabilities, shape [num_frames, num_speakers].
     /// Values in [0.0, 1.0].
     pub predictions: Array2<f32>,
     /// Number of valid frames (may be <= predictions.nrows()).
@@ -193,11 +201,12 @@ pub struct Sortformer {
     pub fifo_len: usize,
     pub spkcache_len: usize,
     pub right_context: usize,
+    pub num_speakers: usize,
     // Streaming state. note that, Same way as Nemo
     spkcache: Array3<f32>,               // (1, 0..spkcache_len, EMB_DIM)
-    spkcache_preds: Option<Array3<f32>>, // (1, 0..spkcache_len, NUM_SPEAKERS)
+    spkcache_preds: Option<Array3<f32>>, // (1, 0..spkcache_len, num_speakers)
     fifo: Array3<f32>,                   // (1, 0..fifo_len, EMB_DIM)
-    fifo_preds: Array3<f32>,             // (1, 0..fifo_len, NUM_SPEAKERS)
+    fifo_preds: Array3<f32>,             // (1, 0..fifo_len, num_speakers)
     mean_sil_emb: Array2<f32>,           // (1, EMB_DIM)
     n_sil_frames: usize,
     // Buffered streaming state (used by feed/flush)
@@ -222,29 +231,41 @@ impl Sortformer {
         let config_to_use = execution_config.unwrap_or_default();
         let session = config_to_use.build_session(model_path.as_ref())?;
 
-        // Read streaming constants from ONNX metadata (fallback to defaults)
-        let (chunk_len, fifo_len, spkcache_len, right_context) =
-            if let Ok(metadata) = session.metadata() {
-                let c = metadata
+        // Read streaming constants from ONNX metadata (fallback to defaults).
+        // Values must be copied before `session` is moved into `Self`.
+        let (chunk_len, fifo_len, spkcache_len, right_context, num_speakers) = session
+            .metadata()
+            .map(|m| {
+                let c = m
                     .custom("chunk_len")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(CHUNK_LEN);
-                let f = metadata
+                let f = m
                     .custom("fifo_len")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(FIFO_LEN);
-                let s = metadata
+                let s = m
                     .custom("spkcache_len")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(SPKCACHE_LEN);
-                let r = metadata
+                let r = m
                     .custom("right_context")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(RIGHT_CONTEXT);
-                (c, f, s, r)
-            } else {
-                (CHUNK_LEN, FIFO_LEN, SPKCACHE_LEN, RIGHT_CONTEXT)
-            };
+                let n = m
+                    .custom("num_speakers")
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&count| count > 0)
+                    .unwrap_or(DEFAULT_NUM_SPEAKERS);
+                (c, f, s, r, n)
+            })
+            .unwrap_or((
+                CHUNK_LEN,
+                FIFO_LEN,
+                SPKCACHE_LEN,
+                RIGHT_CONTEXT,
+                DEFAULT_NUM_SPEAKERS,
+            ));
 
         let mel_basis = crate::audio::create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE);
 
@@ -255,10 +276,11 @@ impl Sortformer {
             fifo_len,
             spkcache_len,
             right_context,
+            num_speakers,
             spkcache: Array3::zeros((1, 0, EMB_DIM)),
             spkcache_preds: None,
             fifo: Array3::zeros((1, 0, EMB_DIM)),
-            fifo_preds: Array3::zeros((1, 0, NUM_SPEAKERS)),
+            fifo_preds: Array3::zeros((1, 0, num_speakers)),
             mean_sil_emb: Array2::zeros((1, EMB_DIM)),
             n_sil_frames: 0,
             audio_buffer: Vec::new(),
@@ -275,12 +297,17 @@ impl Sortformer {
         (self.chunk_len + self.right_context) as f32 * FRAME_DURATION
     }
 
+    /// Number of speaker output channels (from ONNX metadata, default 4).
+    pub fn num_speakers(&self) -> usize {
+        self.num_speakers
+    }
+
     /// Reset streaming state
     pub fn reset_state(&mut self) {
         self.spkcache = Array3::zeros((1, 0, EMB_DIM));
         self.spkcache_preds = None;
         self.fifo = Array3::zeros((1, 0, EMB_DIM));
-        self.fifo_preds = Array3::zeros((1, 0, NUM_SPEAKERS));
+        self.fifo_preds = Array3::zeros((1, 0, self.num_speakers));
         self.mean_sil_emb = Array2::zeros((1, EMB_DIM));
         self.n_sil_frames = 0;
         self.audio_buffer.clear();
@@ -386,14 +413,14 @@ impl Sortformer {
     /// * `audio_16k_mono` - Audio chunk at 16kHz mono (any length, typically 2-30s)
     ///
     /// # Returns
-    /// Raw predictions with shape [num_frames, NUM_SPEAKERS], values in [0.0, 1.0]
+    /// Raw predictions with shape [num_frames, num_speakers], values in [0.0, 1.0]
     pub fn diarize_chunk_raw(
         &mut self,
         audio_16k_mono: &[f32],
     ) -> Result<RawDiarizationPredictions> {
         if audio_16k_mono.is_empty() {
             return Ok(RawDiarizationPredictions {
-                predictions: Array2::zeros((0, NUM_SPEAKERS)),
+                predictions: Array2::zeros((0, self.num_speakers)),
                 num_valid_frames: 0,
             });
         }
@@ -544,7 +571,7 @@ impl Sortformer {
             all_chunk_preds.push(chunk_preds);
         }
 
-        Ok(Self::concat_predictions(&all_chunk_preds))
+        Ok(Self::concat_predictions(&all_chunk_preds, self.num_speakers))
     }
 
     /// NeMo's streaming_update with smart cache compression
@@ -633,7 +660,7 @@ impl Sortformer {
                 .slice(s![0, spkcache_len..spkcache_len + fifo_len, ..])
                 .to_owned()
         } else {
-            Array2::zeros((0, NUM_SPEAKERS))
+            Array2::zeros((0, self.num_speakers))
         };
 
         // only keep chunk_len predictions/embeddings... right_context frames
@@ -706,7 +733,7 @@ impl Sortformer {
         let preds_2d = preds.slice(s![0, .., ..]);
 
         for t in 0..preds_2d.shape()[0] {
-            let sum: f32 = (0..NUM_SPEAKERS).map(|s| preds_2d[[t, s]]).sum();
+            let sum: f32 = (0..self.num_speakers).map(|s| preds_2d[[t, s]]).sum();
             if sum < SIL_THRESHOLD {
                 // This is a silence frame
                 let emb = embs.slice(s![0, t, ..]);
@@ -736,7 +763,7 @@ impl Sortformer {
         };
 
         let n_frames = self.spkcache.shape()[1];
-        let per_spk = self.spkcache_len / NUM_SPEAKERS;
+        let per_spk = self.spkcache_len / self.num_speakers;
         if per_spk <= SPKCACHE_SIL_FRAMES_PER_SPK {
             // truncate if cache too small for compression
             self.spkcache = self.spkcache.slice(s![.., ..self.spkcache_len, ..]).to_owned();
@@ -764,12 +791,12 @@ impl Sortformer {
         // Add silence frames placeholder
         if SPKCACHE_SIL_FRAMES_PER_SPK > 0 {
             let mut padded = Array2::from_elem(
-                (n_frames + SPKCACHE_SIL_FRAMES_PER_SPK, NUM_SPEAKERS),
+                (n_frames + SPKCACHE_SIL_FRAMES_PER_SPK, self.num_speakers),
                 f32::NEG_INFINITY,
             );
             padded.slice_mut(s![..n_frames, ..]).assign(&scores);
             for i in n_frames..n_frames + SPKCACHE_SIL_FRAMES_PER_SPK {
-                for j in 0..NUM_SPEAKERS {
+                for j in 0..self.num_speakers {
                     padded[[i, j]] = f32::INFINITY;
                 }
             }
@@ -792,13 +819,13 @@ impl Sortformer {
 
         for t in 0..preds.shape()[0] {
             let mut log_1_probs_sum = 0.0f32;
-            for s in 0..NUM_SPEAKERS {
+            for s in 0..self.num_speakers {
                 let p = preds[[t, s]].max(PRED_SCORE_THRESHOLD);
                 let log_1_p = (1.0 - p).max(PRED_SCORE_THRESHOLD).ln();
                 log_1_probs_sum += log_1_p;
             }
 
-            for s in 0..NUM_SPEAKERS {
+            for s in 0..self.num_speakers {
                 let p = preds[[t, s]].max(PRED_SCORE_THRESHOLD);
                 let log_p = p.ln();
                 let log_1_p = (1.0 - p).max(PRED_SCORE_THRESHOLD).ln();
@@ -817,9 +844,9 @@ impl Sortformer {
         min_pos_scores_per_spk: usize,
     ) -> Array2<f32> {
         // Count positive scores per speaker
-        let mut pos_count = [0usize; NUM_SPEAKERS];
+        let mut pos_count = vec![0usize; self.num_speakers];
         for t in 0..scores.shape()[0] {
-            for s in 0..NUM_SPEAKERS {
+            for s in 0..self.num_speakers {
                 if scores[[t, s]] > 0.0 {
                     pos_count[s] += 1;
                 }
@@ -827,7 +854,7 @@ impl Sortformer {
         }
 
         for t in 0..preds.shape()[0] {
-            for s in 0..NUM_SPEAKERS {
+            for s in 0..self.num_speakers {
                 let is_speech = preds[[t, s]] > 0.5;
 
                 if !is_speech {
@@ -851,7 +878,7 @@ impl Sortformer {
         n_boost_per_spk: usize,
         scale_factor: f32,
     ) -> Array2<f32> {
-        for s in 0..NUM_SPEAKERS {
+        for s in 0..self.num_speakers {
             // Get column for this speaker
             let col: Vec<(usize, f32)> = (0..scores.shape()[0])
                 .map(|t| (t, scores[[t, s]]))
@@ -884,8 +911,9 @@ impl Sortformer {
         // Flatten scores as (S, T) then reshape to (S*T,)
         // This means we iterate: speaker 0 all times, then speaker 1 all times, etc.
         // flat_index = speaker * n_frames + time
-        let mut flat_scores: Vec<(usize, f32)> = Vec::with_capacity(n_frames * NUM_SPEAKERS);
-        for s in 0..NUM_SPEAKERS {
+        let mut flat_scores: Vec<(usize, f32)> =
+            Vec::with_capacity(n_frames * self.num_speakers);
+        for s in 0..self.num_speakers {
             for t in 0..n_frames {
                 let flat_idx = s * n_frames + t;
                 flat_scores.push((flat_idx, scores[[t, s]]));
@@ -944,7 +972,7 @@ impl Sortformer {
         is_disabled: &[bool],
     ) -> (Array3<f32>, Array3<f32>) {
         let mut new_embs = Array3::zeros((1, self.spkcache_len, EMB_DIM));
-        let mut new_preds = Array3::zeros((1, self.spkcache_len, NUM_SPEAKERS));
+        let mut new_preds = Array3::zeros((1, self.spkcache_len, self.num_speakers));
 
         let cache_preds = self.spkcache_preds.as_ref().unwrap();
 
@@ -995,9 +1023,9 @@ impl Sortformer {
     }
 
     /// Concatenate predictions
-    fn concat_predictions(preds: &[Array2<f32>]) -> Array2<f32> {
+    fn concat_predictions(preds: &[Array2<f32>], num_speakers: usize) -> Array2<f32> {
         if preds.is_empty() {
-            return Array2::zeros((0, NUM_SPEAKERS));
+            return Array2::zeros((0, num_speakers));
         }
         if preds.len() == 1 {
             return preds[0].clone();
@@ -1013,7 +1041,7 @@ impl Sortformer {
         let half = window / 2;
         let mut filtered = preds.clone();
 
-        for spk in 0..NUM_SPEAKERS {
+        for spk in 0..self.num_speakers {
             for t in 0..preds.shape()[0] {
                 let start = t.saturating_sub(half);
                 let end = (t + half + 1).min(preds.shape()[0]);
@@ -1040,7 +1068,7 @@ impl Sortformer {
         let min_dur_off_samples = (self.config.min_duration_off * SAMPLE_RATE as f32) as u64;
         let samples_per_frame = (FRAME_DURATION * SAMPLE_RATE as f32) as u64;
 
-        for spk in 0..NUM_SPEAKERS {
+        for spk in 0..self.num_speakers {
             let mut in_seg = false;
             let mut seg_start = 0;
             let mut temp_segments = Vec::new();

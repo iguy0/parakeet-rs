@@ -22,8 +22,8 @@ const N_MELS: usize = 128;
 const PREEMPH: f32 = 0.97;
 const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8;
 
-// Streaming chunk config (identical across English-only and multilingual variants:
-// both use chunk_size_output=7 in NeMo's streaming_cfg which corresponds to 56 mel frames).
+// Streaming chunk config for 560 ms exports (--right-context 6):
+// 56 mel frames x 10 ms hop = 560 ms of audio per encoder step.
 const CHUNK_SIZE: usize = 56;
 const PRE_ENCODE_CACHE: usize = 9;
 // FastConformer subsamples mel frames by 8x, so each encoder output frame spans

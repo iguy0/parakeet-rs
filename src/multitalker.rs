@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_multitalker::{MultitalkerEncoderCache, MultitalkerModel};
 use crate::nemotron::SentencePieceVocab;
-use crate::sortformer::{Sortformer, NUM_SPEAKERS};
+use crate::sortformer::{Sortformer, DEFAULT_NUM_SPEAKERS};
 use crate::timestamps::{self, TimestampMode};
 use crate::transcriber::Transcriber;
 use ndarray::{s, Array2, Array3};
@@ -162,9 +162,8 @@ impl LatencyMode {
 /// calling [`MultitalkerASR::reset()`] first (the setter does this automatically).
 #[derive(Debug, Clone)]
 pub struct MultitalkerConfig {
-    /// Maximum number of concurrent speakers to track (1..=4).
-    /// The Sortformer model supports up to 4 speaker slots. Setting this
-    /// lower reduces compute by skipping inactive slots.
+    /// Maximum number of concurrent speakers to track.
+    /// Capped automatically to the loaded Sortformer model's `num_speakers`.
     pub max_speakers: usize,
 
     /// Minimum speaker activity probability to consider a speaker active
@@ -180,7 +179,7 @@ pub struct MultitalkerConfig {
 impl Default for MultitalkerConfig {
     fn default() -> Self {
         Self {
-            max_speakers: NUM_SPEAKERS,
+            max_speakers: DEFAULT_NUM_SPEAKERS,
             activity_threshold: SPEAKER_ACTIVITY_THRESHOLD,
             latency_mode: LatencyMode::default(),
         }
@@ -228,18 +227,20 @@ impl MultitalkerASR {
         let model = MultitalkerModel::from_pretrained(asr_dir, exec.clone())?;
         let sortformer = Sortformer::with_config(
             sortformer_model_path,
-            Some(exec),
+            Some(exec.clone()),
             crate::sortformer::DiarizationConfig::default(),
         )?;
 
         let mel_basis = crate::audio::create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE);
+        let mut config = MultitalkerConfig::default();
+        config.max_speakers = sortformer.num_speakers();
 
         Ok(Self {
             model,
             sortformer,
             vocab,
             speakers: Vec::new(),
-            config: MultitalkerConfig::default(),
+            config,
             mel_basis,
             audio_buffer: Vec::new(),
             audio_processed: 0,
@@ -261,13 +262,13 @@ impl MultitalkerASR {
         &self.config
     }
 
-    /// Set the maximum number of speakers to track (1..=4).
+    /// Set the maximum number of speakers to track.
     ///
     /// Can be called between chunks to adjust mid-session. Existing speaker
     /// instances above the new limit will still produce output for any
     /// already-accumulated tokens, but won't receive new audio.
     pub fn set_max_speakers(&mut self, max_speakers: usize) {
-        self.config.max_speakers = max_speakers.clamp(1, NUM_SPEAKERS);
+        self.config.max_speakers = max_speakers.clamp(1, self.sortformer.num_speakers());
     }
 
     /// Set the speaker activity threshold (0.0..=1.0).

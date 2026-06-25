@@ -1,19 +1,20 @@
-# Export NVIDIA Nemotron Streaming ASR to ONNX 
+# Export NVIDIA Nemotron Streaming ASR to ONNX
 #
-# I exported this model entirely on Google Colab (free T4 is enough, CPU-only
-# works too but is slower). NeMo + its dependencies are heavy so Colab is the
-# easiest way to get a working environment without polluting your local setup.
+# Streaming latency is chosen at export time via --right-context (not at quantize
+# or Rust load time). parakeet-rs mel chunk size must match the export:
 #
-# The script exports the cache-aware streaming encoder and RNNT decoder/joint
-# network as separate ONNX files, along with the SentencePiece tokenizer and
-# a JSON config that describes cache shapes and streaming parameters -- our
-# Rust inference code reads this config to set up the streaming loop.
+#   Latency   --right-context   Mel frames/step   Samples/step @ 16 kHz
+#   80 ms     0                 8                 1280
+#   160 ms    1                 16                2560
+#   560 ms    6 (default)       56                8960
+#   1120 ms   13                112               17920
 #
 # Colab setup:
 #   !pip install nemo_toolkit[asr] onnx onnxruntime soundfile
 #
 # Usage:
-#   python export_nemotron_streaming.py nemotron-speech-streaming-en-0.6b.nemo ./onnx_out
+#   python export_nemotron_streaming.py model.nemo out_onnx/
+#   python export_nemotron_streaming.py model.nemo out_onnx/ --right-context 13  # 1120 ms
 #
 # Output:
 #   <output_dir>/
@@ -42,22 +43,49 @@ import torch
 
 import nemo.collections.asr as nemo_asr
 
+# NVIDIA-documented streaming modes (ms -> att_context right size).
+# Mel frames per step = latency_ms / 10 (10 ms hop). Update CHUNK_SIZE in
+# parakeet-rs/src/nemotron.rs to the same mel-frame count after changing this.
+STREAMING_LATENCY_MS = {
+    0: 80,
+    1: 160,
+    6: 560,
+    13: 1120,
+}
+
+LATENCY_HELP = (
+    "Streaming latency presets (--right-context -> ms): "
+    + ", ".join(f"{rc}={ms}ms" for rc, ms in sorted(STREAMING_LATENCY_MS.items()))
+    + ". Default 6 = 560 ms. Use 13 for 1120 ms."
+)
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
 parser = argparse.ArgumentParser(
-    description="Export Nemotron streaming ASR model to ONNX"
+    description="Export Nemotron streaming ASR model to ONNX",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=(
+        "Streaming latency is fixed at export time. Re-export and re-quantize "
+        "to change it; then set CHUNK_SIZE in parakeet-rs/src/nemotron.rs to "
+        "latency_ms / 10 mel frames.\n\n"
+        "  ms     --right-context   mel frames   samples @ 16 kHz\n"
+        "  80     0                 8            1280\n"
+        "  160    1                 16           2560\n"
+        "  560    6 (default)       56           8960\n"
+        "  1120   13                112          17920\n"
+    ),
 )
 parser.add_argument("input_path", help="Path to .nemo model file")
 parser.add_argument("output_dir", help="Directory for ONNX outputs")
 parser.add_argument(
     "--left-context", type=int, default=70,
-    help="Attention left context (default: 70)"
+    help="Attention left context in frames (default: 70; keep unless you know otherwise)",
 )
 parser.add_argument(
     "--right-context", type=int, default=6,
-    help="Attention right context (default: 6)"
+    help=LATENCY_HELP,
 )
 args = parser.parse_args()
 
@@ -147,6 +175,11 @@ subsampling_factor = model.cfg.encoder.get("subsampling_factor", 8)
 left_context = ATT_CONTEXT_SIZE[0]
 right_context = ATT_CONTEXT_SIZE[1]
 chunk_size = right_context + 1  # output frames per chunk
+latency_ms = (right_context + 1) * 80
+if right_context in STREAMING_LATENCY_MS:
+    print(f"  Streaming latency   : {STREAMING_LATENCY_MS[right_context]} ms (documented preset)")
+else:
+    print(f"  Streaming latency   : ~{latency_ms} ms (custom right-context)")
 
 print(f"  Subsampling factor : {subsampling_factor}")
 print(f"  Left context       : {left_context}")

@@ -9,7 +9,11 @@ Download test audio:
 wget https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/6_speakers.wav
 
 Usage:
-cargo run --example streaming-diarization --features sortformer <audio.wav>
+cargo run --example streaming-diarization --features sortformer <audio.wav> [model.onnx]
+
+8-speaker example:
+cargo run --example streaming-diarization --features sortformer audio.wav \\
+  ../out_diar_8spk/ultra_diar_streaming_sortformer_8spk_v1.onnx
 */
 
 #[cfg(feature = "sortformer")]
@@ -35,8 +39,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start_time = Instant::now();
         let args: Vec<String> = env::args().collect();
         let audio_path = args.get(1).expect(
-            "Please specify audio file: cargo run --example streaming-diarization --features sortformer <audio.wav>",
+            "Usage: streaming-diarization <audio.wav> [model.onnx]",
         );
+        let model_path = args
+            .get(2)
+            .map(String::as_str)
+            .unwrap_or("diar_streaming_sortformer_4spk-v2.1.onnx");
 
         // Load audio
         let mut reader = hound::WavReader::open(audio_path)?;
@@ -66,13 +74,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Create Sortformer
         let mut sortformer = Sortformer::with_config(
-            "diar_streaming_sortformer_4spk-v2.1.onnx",
+            model_path,
             None,
             DiarizationConfig::callhome(),
         )?;
 
         println!(
-            "Config: chunk_len={}, right_context={}, latency={:.2}s",
+            "Model: {} | speakers={} chunk_len={} right_context={} latency={:.2}s",
+            model_path,
+            sortformer.num_speakers(),
             sortformer.chunk_len,
             sortformer.right_context,
             sortformer.latency()

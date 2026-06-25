@@ -108,6 +108,7 @@ model_onnx.metadata_props.append(onnx.StringStringEntryProto(key="chunk_len", va
 model_onnx.metadata_props.append(onnx.StringStringEntryProto(key="fifo_len", value=str(args.fifo_len)))
 model_onnx.metadata_props.append(onnx.StringStringEntryProto(key="spkcache_len", value=str(args.spkcache_len)))
 model_onnx.metadata_props.append(onnx.StringStringEntryProto(key="right_context", value=str(args.right_context)))
+model_onnx.metadata_props.append(onnx.StringStringEntryProto(key="num_speakers", value="4"))
 
 print("\nSaving model with custom metadata")
 
