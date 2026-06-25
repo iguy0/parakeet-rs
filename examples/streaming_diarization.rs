@@ -13,7 +13,7 @@ cargo run --example streaming-diarization --features sortformer <audio.wav> [mod
 
 8-speaker example:
 cargo run --example streaming-diarization --features sortformer audio.wav \\
-  ../out_diar_8spk/ultra_diar_streaming_sortformer_8spk_v1.onnx
+  ../ultra_diar_streaming_sortformer_8spk_v1_onnx/ultra_diar_streaming_sortformer_8spk_v1.onnx
 */
 
 #[cfg(feature = "sortformer")]
