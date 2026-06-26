@@ -1,14 +1,45 @@
-/target
-DS_Store
+# Rust build artifacts
+/target/
+
+# OS / editor
+.DS_Store
 *.DS_Store
-.idea
-.vscode
+.idea/
+.vscode/
+*.swp
+*~
 *.log
+
+# Local environment
+.env
+.env.*
+
+# Model weights and exports (download or generate locally — see AGENTS.md)
+models/
+*.nemo
 *.onnx
-*.json
-*.onnx_data
-*.wav
-*.txt
 *.onnx.data
+*.onnx_data*
 *.onnx_data_*
 *.model
+out_onnx/
+out_onnx_int8/
+
+# Legacy per-model dirs at repo root (if exported outside models/)
+nemotron-speech-streaming-en-0.6b/
+ultra_diar_streaming_sortformer_8spk_v1/
+ultra_diar_streaming_sortformer_8spk_v1_onnx/
+
+# Local benchmark audio, transcripts, and CSV reports
+samples/
+
+# Nested parakeet-rs fork (separate git repo)
+parakeet-rs/
+
+# Python
+__pycache__/
+*.pyc
+.cache/
+
+# Scratch / temp files
+scripts/test_write.txt

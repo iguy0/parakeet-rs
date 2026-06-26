@@ -47,6 +47,7 @@ mod audio;
 mod config;
 mod decoder;
 mod decoder_tdt;
+mod decoding;
 mod error;
 mod execution;
 mod model;
@@ -85,6 +86,10 @@ pub use audio::FeatureCache;
 pub use config::{ModelConfig as ModelConfigJson, PreprocessorConfig};
 
 pub use decoder::{ParakeetDecoder, TimedToken, TranscriptionResult};
+pub use decoding::{
+    decode_ctc_beam, decode_rnnt_beam, decode_tdt_beam, BeamConfig, DecodingStrategy,
+    RnntBeamOutput, RnntHypothesis, TdtBeamOutput, TdtHypothesis,
+};
 pub use model::ParakeetModel;
 pub use model_eou::ParakeetEOUModel;
 pub use model_nemotron::{NemotronEncoderCache, NemotronModel, NemotronModelConfig};

@@ -9,11 +9,14 @@ Download test audio:
 wget https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/6_speakers.wav
 
 Usage:
-cargo run --example streaming-diarization --features sortformer <audio.wav> [model.onnx]
+cargo run --example streaming-diarization --features sortformer <audio.wav> [model.onnx] [config]
+
+Configs: auto (default), callhome, dihard3, ultra-8spk, sensitive
 
 8-speaker example:
-cargo run --example streaming-diarization --features sortformer audio.wav \\
-  ../ultra_diar_streaming_sortformer_8spk_v1_onnx/ultra_diar_streaming_sortformer_8spk_v1.onnx
+cargo run --example streaming-diarization --features sortformer 6_speakers.wav \\
+  ../ultra_diar_streaming_sortformer_8spk_v1_onnx/ultra_diar_streaming_sortformer_8spk_v1.onnx \\
+  ultra-8spk
 */
 
 #[cfg(feature = "sortformer")]
@@ -45,6 +48,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .get(2)
             .map(String::as_str)
             .unwrap_or("diar_streaming_sortformer_4spk-v2.1.onnx");
+        let config_label = args
+            .get(3)
+            .filter(|s| *s != "--full")
+            .map(|s| s.as_str())
+            .unwrap_or("auto");
+        let use_full_file = args.iter().any(|s| s == "--full");
+        let diar_config = match config_label {
+            "callhome" => DiarizationConfig::callhome(),
+            "dihard3" => DiarizationConfig::dihard3(),
+            "ultra-8spk" | "8spk" => DiarizationConfig::ultra_8spk(),
+            "sensitive" => {
+                let mut cfg = DiarizationConfig::custom(0.42, 0.32);
+                cfg.min_duration_on = 0.15;
+                cfg.min_duration_off = 0.10;
+                cfg.median_window = 7;
+                cfg
+            }
+            "auto" => {
+                if model_path.contains("8spk") {
+                    DiarizationConfig::ultra_8spk()
+                } else {
+                    DiarizationConfig::callhome()
+                }
+            }
+            other => {
+                return Err(format!(
+                    "Unknown config '{other}'. Use: auto, callhome, dihard3, ultra-8spk, sensitive"
+                )
+                .into());
+            }
+        };
 
         // Load audio
         let mut reader = hound::WavReader::open(audio_path)?;
@@ -73,15 +107,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Loaded {:.1}s of audio", duration);
 
         // Create Sortformer
-        let mut sortformer = Sortformer::with_config(
-            model_path,
-            None,
-            DiarizationConfig::callhome(),
-        )?;
+        let mut sortformer = Sortformer::with_config(model_path, None, diar_config)?;
 
         println!(
-            "Model: {} | speakers={} chunk_len={} right_context={} latency={:.2}s",
+            "Model: {} | config={} | mode={} | speakers={} chunk_len={} right_context={} latency={:.2}s",
             model_path,
+            config_label,
+            if use_full_file { "full" } else { "streaming" },
             sortformer.num_speakers(),
             sortformer.chunk_len,
             sortformer.right_context,
@@ -93,12 +125,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let feed_chunk_size = 320; // 20ms at 16kHz
         let mut total_segments = 0;
 
-        println!("\nStreaming diarization (feeding {}ms chunks):", feed_chunk_size * 1000 / 16_000);
-        println!("{}", "-".repeat(60));
-
-        for chunk in audio.chunks(feed_chunk_size) {
-            let segments = sortformer.feed(chunk)?;
-
+        if use_full_file {
+            println!("\nFull-file diarization (diarize):");
+            println!("{}", "-".repeat(60));
+            let segments = sortformer.diarize(audio, 16_000, 1)?;
             for seg in &segments {
                 println!(
                     "  [{:06.2}s - {:06.2}s] Speaker {}",
@@ -107,20 +137,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     seg.speaker_id
                 );
             }
-            total_segments += segments.len();
-        }
+            total_segments = segments.len();
+        } else {
+            println!("\nStreaming diarization (feeding {}ms chunks):", feed_chunk_size * 1000 / 16_000);
+            println!("{}", "-".repeat(60));
 
-        // Flush remaining buffered audio
-        let final_segments = sortformer.flush()?;
-        for seg in &final_segments {
-            println!(
-                "  [{:06.2}s - {:06.2}s] Speaker {} (flush)",
-                seg.start as f64 / 16_000.0,
-                seg.end as f64 / 16_000.0,
-                seg.speaker_id
-            );
+            for chunk in audio.chunks(feed_chunk_size) {
+                let segments = sortformer.feed(chunk)?;
+
+                for seg in &segments {
+                    println!(
+                        "  [{:06.2}s - {:06.2}s] Speaker {}",
+                        seg.start as f64 / 16_000.0,
+                        seg.end as f64 / 16_000.0,
+                        seg.speaker_id
+                    );
+                }
+                total_segments += segments.len();
+            }
+
+            let final_segments = sortformer.flush()?;
+            for seg in &final_segments {
+                println!(
+                    "  [{:06.2}s - {:06.2}s] Speaker {} (flush)",
+                    seg.start as f64 / 16_000.0,
+                    seg.end as f64 / 16_000.0,
+                    seg.speaker_id
+                );
+            }
+            total_segments += final_segments.len();
         }
-        total_segments += final_segments.len();
 
         println!("{}", "-".repeat(60));
         println!(

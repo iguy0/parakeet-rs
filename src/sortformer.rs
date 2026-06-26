@@ -78,8 +78,10 @@ const MAX_INDEX: usize = 99999;
 /// - `median_window`: Smoothing window size (odd number, higher = smoother)
 ///
 /// # Pre-tuned Configs
-/// - `callhome()` - (default)
-/// - `dihard3()`
+/// - `callhome()` - NVIDIA 4spk default
+/// - `dihard3()` - more sensitive, shorter segments
+/// - `ultra_8spk()` - tuned for Ultra Sortformer 8-speaker exports
+/// - `for_num_speakers(n)` - `callhome()` if n <= 4, else `ultra_8spk()`
 ///
 /// # Custom Config
 /// Use `custom(onset, offset)` to create your own config for fine-tuning.
@@ -128,6 +130,35 @@ impl DiarizationConfig {
             min_duration_on: 0.007,
             min_duration_off: 0.151,
             median_window: 11,
+        }
+    }
+
+    /// Post-processing preset for Ultra Sortformer 8-speaker ONNX exports.
+    ///
+    /// NVIDIA CallHome thresholds are too strict for 8-way sigmoid heads: per-speaker
+    /// activations are typically lower when more channels compete. This preset uses
+    /// lower onset/offset, shorter minimum segment duration, and slightly less median
+    /// smoothing than `callhome()`.
+    ///
+    /// Start here for `num_speakers > 4`; refine with `custom()` on your own audio.
+    pub fn ultra_8spk() -> Self {
+        Self {
+            onset: 0.48,
+            offset: 0.38,
+            pad_onset: 0.15,
+            pad_offset: 0.05,
+            min_duration_on: 0.20,
+            min_duration_off: 0.12,
+            median_window: 9,
+        }
+    }
+
+    /// Pick a reasonable default post-processing preset for the model's speaker count.
+    pub fn for_num_speakers(num_speakers: usize) -> Self {
+        if num_speakers > DEFAULT_NUM_SPEAKERS {
+            Self::ultra_8spk()
+        } else {
+            Self::callhome()
         }
     }
 

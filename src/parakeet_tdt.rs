@@ -2,6 +2,7 @@ use crate::audio::{self, FeatureCache};
 use crate::config::PreprocessorConfig;
 use crate::decoder::TranscriptionResult;
 use crate::decoder_tdt::ParakeetTDTDecoder;
+use crate::decoding::DecodingStrategy;
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_tdt::ParakeetTDTModel;
@@ -17,6 +18,7 @@ pub struct ParakeetTDT {
     preprocessor_config: PreprocessorConfig,
     feature_cache: FeatureCache,
     model_dir: PathBuf,
+    decoding: DecodingStrategy,
 }
 
 impl ParakeetTDT {
@@ -28,6 +30,15 @@ impl ParakeetTDT {
     pub fn from_pretrained<P: AsRef<Path>>(
         path: P,
         config: Option<ExecutionConfig>,
+    ) -> Result<Self> {
+        Self::from_pretrained_with_decoding(path, config, DecodingStrategy::Greedy)
+    }
+
+    /// Load Parakeet TDT with an explicit decoding strategy (greedy default, or beam).
+    pub fn from_pretrained_with_decoding<P: AsRef<Path>>(
+        path: P,
+        config: Option<ExecutionConfig>,
+        decoding: DecodingStrategy,
     ) -> Result<Self> {
         let path = path.as_ref();
 
@@ -77,7 +88,16 @@ impl ParakeetTDT {
             preprocessor_config,
             feature_cache,
             model_dir: path.to_path_buf(),
+            decoding,
         })
+    }
+
+    pub fn decoding_strategy(&self) -> DecodingStrategy {
+        self.decoding
+    }
+
+    pub fn set_decoding_strategy(&mut self, strategy: DecodingStrategy) {
+        self.decoding = strategy;
     }
 
     pub fn model_dir(&self) -> &Path {
@@ -104,7 +124,8 @@ impl Transcriber for ParakeetTDT {
             &self.preprocessor_config,
             &self.feature_cache,
         )?;
-        let (tokens, frame_indices, durations) = self.model.forward(features)?;
+        let (tokens, frame_indices, durations) =
+            self.model.forward_with_decoding(features, self.decoding)?;
 
         let mut result = self.decoder.decode_with_timestamps(
             &tokens,

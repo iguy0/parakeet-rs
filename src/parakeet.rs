@@ -1,6 +1,7 @@
 use crate::audio::{self, FeatureCache};
 use crate::config::PreprocessorConfig;
 use crate::decoder::{ParakeetDecoder, TranscriptionResult};
+use crate::decoding::DecodingStrategy;
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model::ParakeetModel;
@@ -14,6 +15,7 @@ pub struct Parakeet {
     preprocessor_config: PreprocessorConfig,
     feature_cache: FeatureCache,
     model_dir: PathBuf,
+    decoding: DecodingStrategy,
 }
 
 impl Parakeet {
@@ -40,6 +42,15 @@ impl Parakeet {
     pub fn from_pretrained<P: AsRef<Path>>(
         path: P,
         config: Option<ExecutionConfig>,
+    ) -> Result<Self> {
+        Self::from_pretrained_with_decoding(path, config, DecodingStrategy::Greedy)
+    }
+
+    /// Load Parakeet CTC with an explicit decoding strategy (greedy default, or beam).
+    pub fn from_pretrained_with_decoding<P: AsRef<Path>>(
+        path: P,
+        config: Option<ExecutionConfig>,
+        decoding: DecodingStrategy,
     ) -> Result<Self> {
         let path = path.as_ref();
 
@@ -84,7 +95,16 @@ impl Parakeet {
             preprocessor_config,
             feature_cache,
             model_dir,
+            decoding,
         })
+    }
+
+    pub fn decoding_strategy(&self) -> DecodingStrategy {
+        self.decoding
+    }
+
+    pub fn set_decoding_strategy(&mut self, strategy: DecodingStrategy) {
+        self.decoding = strategy;
     }
 
     fn find_model_file(dir: &Path) -> Result<PathBuf> {
@@ -144,14 +164,28 @@ impl Transcriber for Parakeet {
         )?;
         let logits = self.model.forward(features)?;
 
-        let mut result = self.decoder.decode_with_timestamps(
-            &logits,
-            self.preprocessor_config.hop_length,
-            self.preprocessor_config.sampling_rate,
-        )?;
+        let mut result = match self.decoding {
+            DecodingStrategy::Greedy => self.decoder.decode_with_timestamps(
+                &logits,
+                self.preprocessor_config.hop_length,
+                self.preprocessor_config.sampling_rate,
+            )?,
+            DecodingStrategy::Beam(config) => {
+                let text = self.decoder.decode_with_beam_config(&logits, &config)?;
+                TranscriptionResult {
+                    text,
+                    tokens: Vec::new(),
+                }
+            }
+        };
 
-        // Process timestamps to requested output mode
         let mode = mode.unwrap_or(TimestampMode::Tokens);
+        if result.tokens.is_empty() {
+            // Beam path: timestamps deferred (Phase 5b); keep decoded text as-is.
+            return Ok(result);
+        }
+
+        // Process timestamps to requested output mode (greedy path only).
         result.tokens = process_timestamps(&result.tokens, mode);
 
         // Rebuild full text from processed tokens to ensure consistency

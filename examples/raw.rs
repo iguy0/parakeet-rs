@@ -6,7 +6,9 @@ with sample_rate and channels instead of using transcribe_file()
 
 Usage:
 cargo run --example raw 6_speakers.wav
+cargo run --example raw 6_speakers.wav -- --decoding beam --beam-size 5
 cargo run --example raw 6_speakers.wav tdt
+cargo run --example raw 6_speakers.wav tdt -- --decoding beam --beam-size 5
 
 WARNING: TDT model has sequence length limitations (~8-10 minutes max).
 For longer audio files, you must split into chunks (e.g., 5-minute segments)
@@ -16,9 +18,45 @@ Otherwise you will likely get a error like:
 "Error: Ort(Error { code: RuntimeException, msg: "Non-zero status code returned while running Add node. Name:'/layers.0/self_attn/Add_2' Status Message: /Users/runner/work/ort-artifacts/ort-artifacts/onnxruntime/onnxruntime/core/providers/cpu/math/element_wise_ops.h:540 void onnxruntime::BroadcastIterator::Init(ptrdiff_t, ptrdiff_t) axis == 1 || axis == largest was false. })"
 */
 
-use parakeet_rs::{Parakeet, ParakeetTDT, TimestampMode, Transcriber};
+use parakeet_rs::{BeamConfig, DecodingStrategy, Parakeet, ParakeetTDT, TimestampMode, Transcriber};
 use std::env;
 use std::time::Instant;
+
+fn parse_decoding(args: &[String], default_beam: fn() -> BeamConfig) -> DecodingStrategy {
+    let mut use_beam = false;
+    let mut beam_size = default_beam().beam_size;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--decoding" => {
+                i += 1;
+                if i < args.len() && args[i] == "beam" {
+                    use_beam = true;
+                }
+            }
+            "--beam-size" => {
+                i += 1;
+                if i < args.len() {
+                    if let Ok(size) = args[i].parse::<usize>() {
+                        beam_size = size.max(1);
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if use_beam {
+        DecodingStrategy::Beam(BeamConfig {
+            beam_size,
+            ..default_beam()
+        })
+    } else {
+        DecodingStrategy::Greedy
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
@@ -28,8 +66,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         "6_speakers.wav"
     };
-
-    let use_tdt = args.len() > 2 && args[2] == "tdt";
 
     // Load audio manually using hound (or any other audio library)
     // remember if you use raw audio API, you need to handle audio preprocessing yourself!
@@ -49,9 +85,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect::<Result<Vec<_>, _>>()?,
     };
 
+    let use_tdt = args.iter().any(|a| a == "tdt");
+    let flag_args: Vec<String> = args
+        .iter()
+        .skip_while(|a| *a != "--")
+        .skip(1)
+        .cloned()
+        .collect();
+
     if use_tdt {
-        println!("Loading TDT model...");
-        let mut parakeet = ParakeetTDT::from_pretrained("./tdt", None)?;
+        let decoding = parse_decoding(&flag_args, BeamConfig::default_tdt);
+        match decoding {
+            DecodingStrategy::Greedy => println!("Loading TDT model (decoding: greedy)..."),
+            DecodingStrategy::Beam(c) => println!(
+                "Loading TDT model (decoding: beam, size={}, duration_reward={})...",
+                c.beam_size, c.duration_reward
+            ),
+        }
+        let mut parakeet =
+            ParakeetTDT::from_pretrained_with_decoding("./tdt", None, decoding)?;
 
         // Use transcribe_samples() with raw parameters and timestamp mode
         let result = parakeet.transcribe_samples(
@@ -70,8 +122,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     } else {
-        println!("Loading CTC model...");
-        let mut parakeet = Parakeet::from_pretrained(".", None)?;
+        let decoding = parse_decoding(&flag_args, BeamConfig::default_ctc);
+        match decoding {
+            DecodingStrategy::Greedy => println!("Loading CTC model (decoding: greedy)..."),
+            DecodingStrategy::Beam(c) => println!(
+                "Loading CTC model (decoding: beam, size={})...",
+                c.beam_size
+            ),
+        }
+        let mut parakeet = Parakeet::from_pretrained_with_decoding(".", None, decoding)?;
 
         // CTC model doesn't predict punctuation (lowercase alphabet only)
         // This means no sentence boundaries. we use Words mode instead of Sentences

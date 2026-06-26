@@ -1,0 +1,105 @@
+# parakeet-rs benchmark manifest
+#
+# Human-facing reference for the benchmark harness (scripts/benchmark/run_all.sh).
+# The shell harness reads model directories and clips from environment variables
+# (documented below) rather than parsing this file, to avoid a TOML dependency in
+# bash. This manifest documents the intended model/clip/reference layout so the
+# harness stays generic and portable: any developer can point the env vars at
+# their own local model directories.
+#
+# Override any default by exporting the matching environment variable before
+# running scripts/benchmark/run_all.sh. Models that are not present on disk are
+# skipped gracefully (logged, not failed).
+
+[env]
+# Root that the default model dirs are resolved against (optional convenience).
+PARAKEET_MODELS_ROOT = "."          # else use absolute *_DIR overrides below
+BEAM_SIZE            = "5"          # beam width for the beam runs
+OUT_DIR              = "scripts/benchmark/results"
+
+# Per-model directories (skipped if missing). Layouts per AGENTS.md section 6.
+[models.ctc]
+dir     = "CTC_DIR"                  # env var; default "$PARAKEET_MODELS_ROOT"
+example = "raw"                      # cargo example
+mode    = ""                         # offline CTC (no subcommand)
+files   = ["model.onnx", "model.onnx_data", "tokenizer.json"]
+
+[models.tdt]
+dir     = "TDT_DIR"                  # default "$PARAKEET_MODELS_ROOT/tdt"
+example = "raw"
+mode    = "tdt"                      # raw <wav> tdt ...
+files   = ["encoder-model.onnx", "decoder_joint-model.onnx", "vocab.txt"]
+
+[models.unified_offline]
+dir     = "UNIFIED_DIR"              # default "$PARAKEET_MODELS_ROOT/unified"
+example = "unified"
+mode    = ""                         # offline
+files   = ["encoder.onnx", "encoder.onnx.data", "decoder_joint.onnx", "tokenizer.model"]
+
+[models.unified_streaming]
+dir     = "UNIFIED_DIR"
+example = "unified"
+mode    = "streaming"
+files   = ["encoder.onnx", "encoder.onnx.data", "decoder_joint.onnx", "tokenizer.model"]
+
+# Suggested benchmark clips (point CLIP / CLIPS at your local copies).
+[clips]
+default = "6_speakers.wav"           # multi-speaker repo sample
+# clean_30s   = "clean_30s.wav"      # WER baseline
+# noisy_30s   = "noisy_30s.wav"      # beam quality uplift
+# long_5min   = "long_5min.wav"      # streaming chunk-boundary stress
+
+# Optional reference transcripts for WER (used by compare_greedy_beam.py --reference).
+[references]
+# "6_speakers.wav" = "scripts/benchmark/refs/6_speakers.txt"
+
+# --- Model-backed WER suite (Nemotron / Sortformer / Multitalker) ---------
+#
+# The samples/ folder is auto-discovered by the Rust integration test
+# tests/model_benchmark.rs: every subdir with a *.wav + *_transcript.txt is wired
+# in. WER (with speaker-header/timestamp stripping + normalization) is implemented
+# in tests/common/mod.rs. The smoke clip is always asserted; longer clips run only
+# when PARAKEET_BENCH_ALL=1.
+#
+#   cargo test --release --test model_benchmark \
+#       --features "sortformer multitalker" -- --nocapture
+#
+# Model dirs (env-overridable; default to ./models/...):
+#   PARAKEET_NEMOTRON_DIR    -> models/nemotron-speech-streaming-en-0.6b_int8_onnx
+#   PARAKEET_MULTITALKER_DIR -> models/multitalker-parakeet-streaming-0.6b-v1-onnx-int8
+#   PARAKEET_SORTFORMER_ONNX -> models/sortformer-4spk-v2.1/diar_streaming_sortformer_4spk-v2.1.onnx
+#
+[samples]
+# Auto-discovered; listed here for reference only.
+smoke     = { wav = "samples/smoke/test01_20s.wav", transcript = "samples/smoke/test01_20s_transcript.txt", asserted = true }
+committee = { dir = "samples/committee", note = "~10 min; runs with PARAKEET_BENCH_ALL=1" }
+datascience-staff-meeting = { dir = "samples/datascience-staff-meeting", note = "~29 min; runs with PARAKEET_BENCH_ALL=1" }
+
+# --- CSV reports written under samples/ (compare run-over-run) -------------
+# samples/asr_report.csv          WER/CER + RTF per (model, mode, decoding)
+# samples/diarization_report.csv  DER/JER + RTF per (model, sample)
+#
+# Model coverage in tests/model_benchmark.rs (each gated on weight presence;
+# absent models skip and the test still passes):
+#
+#   Model            Modes tested                 Decodings   Feature
+#   Parakeet CTC     offline                       greedy,beam -
+#   Parakeet TDT     offline                       greedy,beam -
+#   ParakeetUnified  offline + streaming           greedy,beam -
+#   Nemotron         streaming                     greedy      -
+#   Parakeet EOU     streaming                     greedy      -
+#   Multitalker      streaming                     greedy      multitalker
+#   Cohere (int8)    offline                       greedy      cohere
+#   Sortformer       offline + streaming (diarize) -           sortformer
+#
+# Default benchmark group (downloaded int8 weights present):
+#   cargo test --release --test model_benchmark \
+#       --features "sortformer multitalker cohere" -- --nocapture
+#   -> runs Nemotron + Multitalker + Cohere ASR (WER/CER/RTF) and Sortformer
+#      diarization (DER/JER/RTF), writing both CSVs under samples/.
+#   Cohere int8 dir: models/cohere-transcribe-03-2026-int8 (onnx/*_quantized.onnx).
+#
+# Model dirs (env-overridable; defaults under models/):
+#   PARAKEET_CTC_DIR PARAKEET_TDT_DIR PARAKEET_UNIFIED_DIR
+#   PARAKEET_EOU_DIR PARAKEET_COHERE_DIR (+ the Nemotron/Multitalker/Sortformer
+#   vars listed above).

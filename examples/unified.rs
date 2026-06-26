@@ -3,9 +3,11 @@ Unified model: offline + buffered streaming transcription
 
 Offline:
 cargo run --release --example unified 6_speakers.wav
+cargo run --release --example unified 6_speakers.wav -- --decoding beam --beam-size 5
 
 Streaming:
 cargo run --release --example unified 6_speakers.wav streaming
+cargo run --release --example unified 6_speakers.wav streaming -- --decoding beam
 
 ---
 
@@ -14,25 +16,77 @@ Files: encoder.onnx, encoder.onnx.data, decoder_joint.onnx, tokenizer.model
 Place in: ./unified/
 */
 
-use parakeet_rs::{ParakeetUnified, TimestampMode, Transcriber};
+use parakeet_rs::{BeamConfig, DecodingStrategy, ParakeetUnified, TimestampMode, Transcriber};
 use std::env;
 use std::io::Write;
 use std::time::Instant;
 
+struct CliOptions {
+    audio_path: String,
+    streaming: bool,
+    decoding: DecodingStrategy,
+}
+
+fn parse_cli(args: &[String]) -> CliOptions {
+    let mut audio_path = "6_speakers.wav".to_string();
+    let mut streaming = false;
+    let mut use_beam = false;
+    let mut beam_size = BeamConfig::default_unified().beam_size;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "streaming" => streaming = true,
+            "--decoding" => {
+                i += 1;
+                if i < args.len() && args[i] == "beam" {
+                    use_beam = true;
+                }
+            }
+            "--beam-size" => {
+                i += 1;
+                if i < args.len() {
+                    if let Ok(size) = args[i].parse::<usize>() {
+                        beam_size = size.max(1);
+                    }
+                }
+            }
+            flag if flag.starts_with('-') => {}
+            path => audio_path = path.to_string(),
+        }
+        i += 1;
+    }
+
+    let decoding = if use_beam {
+        DecodingStrategy::Beam(BeamConfig {
+            beam_size,
+            ..BeamConfig::default_unified()
+        })
+    } else {
+        DecodingStrategy::Greedy
+    };
+
+    CliOptions {
+        audio_path,
+        streaming,
+        decoding,
+    }
+}
+
+fn decoding_label(decoding: DecodingStrategy) -> String {
+    match decoding {
+        DecodingStrategy::Greedy => "greedy".to_string(),
+        DecodingStrategy::Beam(config) => format!("beam (size={})", config.beam_size),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     let args: Vec<String> = env::args().collect();
-
-    let audio_path = if args.len() > 1 {
-        &args[1]
-    } else {
-        "6_speakers.wav"
-    };
-
-    let use_streaming = args.len() > 2 && args[2] == "streaming";
+    let cli = parse_cli(&args);
 
     // Load audio
-    let mut reader = hound::WavReader::open(audio_path)?;
+    let mut reader = hound::WavReader::open(&cli.audio_path)?;
     let spec = reader.spec();
 
     if spec.sample_rate != 16000 {
@@ -57,11 +111,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let duration = audio.len() as f32 / 16000.0;
     println!("Audio: {:.1}s, {}Hz, {} ch", duration, spec.sample_rate, spec.channels);
 
-    let mut model = ParakeetUnified::from_pretrained("./unified", None)?;
+    let mut model = ParakeetUnified::from_pretrained_with_decoding(
+        "./unified",
+        None,
+        Default::default(),
+        cli.decoding,
+    )?;
     let load_time = start_time.elapsed();
-    println!("Model loaded in {:.2}s", load_time.as_secs_f32());
+    println!(
+        "Model loaded in {:.2}s (decoding: {})",
+        load_time.as_secs_f32(),
+        decoding_label(cli.decoding)
+    );
 
-    if use_streaming {
+    if cli.streaming {
         let config = model.streaming_config();
         let chunk_size = config.chunk_samples();
         println!("Streaming mode: {:.0}ms chunks", config.chunk_secs * 1000.0);

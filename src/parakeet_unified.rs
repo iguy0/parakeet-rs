@@ -1,6 +1,7 @@
 use crate::audio::{self, load_audio};
 use crate::config::PreprocessorConfig;
 use crate::decoder::{TimedToken, TranscriptionResult};
+use crate::decoding::{decode_rnnt_beam, BeamConfig, DecodingStrategy, RnntHypothesis};
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_unified::{ParakeetUnifiedModel, UnifiedModelConfig};
@@ -140,6 +141,8 @@ pub struct ParakeetUnified {
     next_chunk_start_sample: usize,
     accumulated_tokens: Vec<usize>,
     accumulated_timed_tokens: Vec<TimedToken>,
+    decoding: DecodingStrategy,
+    beam_hypotheses: Vec<RnntHypothesis>,
 }
 
 impl ParakeetUnifiedHandle {
@@ -218,8 +221,18 @@ impl ParakeetUnified {
         exec_config: Option<ExecutionConfig>,
         streaming_config: UnifiedStreamingConfig,
     ) -> Result<Self> {
+        Self::from_pretrained_with_decoding(path, exec_config, streaming_config, DecodingStrategy::Greedy)
+    }
+
+    /// Load ParakeetUnified with a custom streaming profile and decoding strategy.
+    pub fn from_pretrained_with_decoding<P: AsRef<Path>>(
+        path: P,
+        exec_config: Option<ExecutionConfig>,
+        streaming_config: UnifiedStreamingConfig,
+        decoding: DecodingStrategy,
+    ) -> Result<Self> {
         let handle = ParakeetUnifiedHandle::from_pretrained(path, exec_config)?;
-        Self::from_shared_with_streaming_config(&handle, streaming_config)
+        Self::from_shared_with_decoding(&handle, streaming_config, decoding)
     }
 
     /// Spawn a new ParakeetUnified instance bound to a shared model, using the
@@ -234,6 +247,15 @@ impl ParakeetUnified {
     pub fn from_shared_with_streaming_config(
         handle: &ParakeetUnifiedHandle,
         streaming_config: UnifiedStreamingConfig,
+    ) -> Result<Self> {
+        Self::from_shared_with_decoding(handle, streaming_config, DecodingStrategy::Greedy)
+    }
+
+    /// Spawn a new instance with custom streaming and decoding settings.
+    pub fn from_shared_with_decoding(
+        handle: &ParakeetUnifiedHandle,
+        streaming_config: UnifiedStreamingConfig,
+        decoding: DecodingStrategy,
     ) -> Result<Self> {
         let streaming_config = streaming_config.validate()?;
         let blank_id = handle.blank_id;
@@ -253,7 +275,18 @@ impl ParakeetUnified {
             next_chunk_start_sample: 0,
             accumulated_tokens: Vec::new(),
             accumulated_timed_tokens: Vec::new(),
+            decoding,
+            beam_hypotheses: Vec::new(),
         })
+    }
+
+    pub fn decoding_strategy(&self) -> DecodingStrategy {
+        self.decoding
+    }
+
+    pub fn set_decoding_strategy(&mut self, strategy: DecodingStrategy) {
+        self.decoding = strategy;
+        self.beam_hypotheses.clear();
     }
 
     pub fn streaming_config(&self) -> UnifiedStreamingConfig {
@@ -273,6 +306,7 @@ impl ParakeetUnified {
         self.next_chunk_start_sample = 0;
         self.accumulated_tokens.clear();
         self.accumulated_timed_tokens.clear();
+        self.beam_hypotheses.clear();
     }
 
     pub fn get_timed_transcript(&self, mode: TimestampMode) -> TranscriptionResult {
@@ -452,6 +486,27 @@ impl ParakeetUnified {
         end_frame: usize,
         absolute_frame_offset: usize,
     ) -> Result<Vec<(usize, usize)>> {
+        match self.decoding {
+            DecodingStrategy::Greedy => {
+                self.decode_encoder_frames_greedy(encoder_out, start_frame, end_frame, absolute_frame_offset)
+            }
+            DecodingStrategy::Beam(beam_config) => self.decode_encoder_frames_beam(
+                encoder_out,
+                start_frame,
+                end_frame,
+                absolute_frame_offset,
+                beam_config,
+            ),
+        }
+    }
+
+    fn decode_encoder_frames_greedy(
+        &mut self,
+        encoder_out: &Array3<f32>,
+        start_frame: usize,
+        end_frame: usize,
+        absolute_frame_offset: usize,
+    ) -> Result<Vec<(usize, usize)>> {
         let mut tokens = Vec::new();
         let hidden_dim = encoder_out.shape()[1];
         let end_frame = end_frame.min(encoder_out.shape()[2]);
@@ -499,6 +554,58 @@ impl ParakeetUnified {
         }
 
         Ok(tokens)
+    }
+
+    fn decode_encoder_frames_beam(
+        &mut self,
+        encoder_out: &Array3<f32>,
+        start_frame: usize,
+        end_frame: usize,
+        absolute_frame_offset: usize,
+        beam_config: BeamConfig,
+    ) -> Result<Vec<(usize, usize)>> {
+        let blank_id = self.blank_id;
+        let mut input_hypotheses = std::mem::take(&mut self.beam_hypotheses);
+        // Cross-chunk carry: survivors from the prior chunk sit at the previous
+        // `end_frame`; remap to this chunk's `start_frame` before continuing.
+        if !input_hypotheses.is_empty() {
+            for h in &mut input_hypotheses {
+                h.frame = start_frame;
+            }
+        }
+
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
+
+        let mut decoder = |frame: &Array3<f32>,
+                           last_token: i32,
+                           state_1: &Array3<f32>,
+                           state_2: &Array3<f32>| {
+            model.run_decoder(frame, last_token, state_1, state_2)
+        };
+
+        let output = decode_rnnt_beam(
+            encoder_out,
+            start_frame,
+            end_frame,
+            absolute_frame_offset,
+            blank_id,
+            &beam_config,
+            input_hypotheses,
+            &mut decoder,
+        )?;
+
+        self.beam_hypotheses = output.hypotheses;
+
+        if let Some(best) = output.best_hypothesis {
+            self.state_1 = best.state_1;
+            self.state_2 = best.state_2;
+            self.last_token = best.last_token;
+        }
+
+        Ok(output.new_tokens)
     }
 
     fn encoder_frame_to_seconds(frame: usize) -> f32 {
@@ -551,7 +658,14 @@ impl ParakeetUnified {
             model.run_encoder(&features)?
         };
         let frame_count = (encoded_len as usize).min(encoded.shape()[2]);
-        let tokens = self.decode_encoder_frames(&encoded, 0, frame_count, 0)?;
+        let tokens = match self.decoding {
+            DecodingStrategy::Greedy => {
+                self.decode_encoder_frames_greedy(&encoded, 0, frame_count, 0)?
+            }
+            DecodingStrategy::Beam(beam_config) => {
+                self.decode_encoder_frames_beam(&encoded, 0, frame_count, 0, beam_config)?
+            }
+        };
         self.accumulated_tokens = tokens.iter().map(|(id, _)| *id).collect();
         self.accumulated_timed_tokens = self.tokens_to_timed(&tokens);
 

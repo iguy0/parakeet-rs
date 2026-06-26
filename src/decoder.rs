@@ -1,3 +1,4 @@
+use crate::decoding::{decode_ctc_beam, BeamConfig};
 use crate::error::{Error, Result};
 use ndarray::Array2;
 use std::path::Path;
@@ -196,13 +197,33 @@ impl ParakeetDecoder {
         })
     }
 
-    // Stub - falls back to greedy decoding. Full beam search with language model is TODO.
+    /// CTC prefix beam search (no language model). Timestamp alignment is not
+    /// computed here; use greedy [`Self::decode_with_timestamps`] when timestamps
+    /// are required.
     pub fn decode_with_beam_search(
         &self,
         logits: &Array2<f32>,
-        _beam_width: usize,
+        beam_width: usize,
     ) -> Result<String> {
-        self.decode(logits)
+        let config = BeamConfig {
+            beam_size: beam_width.max(1),
+            ..BeamConfig::default_ctc()
+        };
+        self.decode_with_beam_config(logits, &config)
+    }
+
+    /// CTC prefix beam search with full [`BeamConfig`].
+    pub fn decode_with_beam_config(
+        &self,
+        logits: &Array2<f32>,
+        config: &BeamConfig,
+    ) -> Result<String> {
+        let collapsed = decode_ctc_beam(logits, self.pad_token_id, config);
+        let text = self
+            .tokenizer
+            .decode(&collapsed, true)
+            .map_err(|e| Error::Tokenizer(format!("Failed to decode: {e}")))?;
+        Ok(text)
     }
 
     pub fn pad_token_id(&self) -> usize {

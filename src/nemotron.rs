@@ -1,4 +1,5 @@
 use crate::decoder::{TimedToken, TranscriptionResult};
+use crate::decoding::{decode_rnnt_beam, DecodingStrategy, RnntHypothesis};
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_nemotron::{NemotronEncoderCache, NemotronModel};
@@ -352,6 +353,15 @@ pub struct Nemotron {
     state_1: Array3<f32>,
     state_2: Array3<f32>,
     last_token: i32,
+    /// Decoding strategy (greedy default; beam reuses the RNNT beam core).
+    decoding: DecodingStrategy,
+    /// Beam-only: hypotheses carried across chunk boundaries (empty in greedy).
+    beam_hypotheses: Vec<RnntHypothesis>,
+    /// Beam-only: full token sequence of the current best hypothesis. In
+    /// streaming mode the per-chunk best path can change, so the coherent
+    /// transcript is read from the global best rather than concatenated
+    /// per-chunk emissions.
+    beam_best_tokens: Vec<usize>,
     /// `None` for English-only mode; `Some(idx)` for multilingual.
     prompt_index: Option<i64>,
     /// Raw audio sample buffer for proper mel computation
@@ -454,6 +464,30 @@ impl Nemotron {
         )?))
     }
 
+    /// Load Nemotron with an explicit decoding strategy (greedy default, or beam).
+    ///
+    /// Beam search reuses the shared RNNT beam core ([`decode_rnnt_beam`]) with
+    /// cross-chunk hypothesis carry, so it works in both streaming
+    /// ([`Self::transcribe_chunk`]) and offline ([`Self::transcribe_audio`]) paths.
+    /// Greedy remains the default for latency-sensitive streaming.
+    pub fn from_pretrained_with_decoding<P: AsRef<Path>>(
+        path: P,
+        exec_config: Option<ExecutionConfig>,
+        decoding: DecodingStrategy,
+    ) -> Result<Self> {
+        let mut model = Self::from_pretrained(path, exec_config)?;
+        model.decoding = decoding;
+        Ok(model)
+    }
+
+    /// Set the decoding strategy on an existing instance. Clears any carried beam
+    /// state so the next utterance starts clean.
+    pub fn set_decoding(&mut self, decoding: DecodingStrategy) {
+        self.decoding = decoding;
+        self.beam_hypotheses.clear();
+        self.beam_best_tokens.clear();
+    }
+
     /// Spawn a new Nemotron instance bound to a shared model.
     ///
     /// Each instance owns independent decoder state (~7.5 MB) while the
@@ -494,6 +528,9 @@ impl Nemotron {
             state_1: Array3::zeros((handle.decoder_lstm_layers, 1, handle.decoder_lstm_dim)),
             state_2: Array3::zeros((handle.decoder_lstm_layers, 1, handle.decoder_lstm_dim)),
             last_token: handle.blank_id as i32,
+            decoding: DecodingStrategy::Greedy,
+            beam_hypotheses: Vec::new(),
+            beam_best_tokens: Vec::new(),
             prompt_index,
             audio_buffer: Vec::new(),
             audio_processed: 0,
@@ -552,6 +589,8 @@ impl Nemotron {
         self.state_1.fill(0.0);
         self.state_2.fill(0.0);
         self.last_token = self.blank_id as i32;
+        self.beam_hypotheses.clear();
+        self.beam_best_tokens.clear();
         self.audio_buffer.clear();
         self.audio_processed = 0;
         self.chunk_idx = 0;
@@ -670,6 +709,11 @@ impl Nemotron {
         // Running count of encoder frames consumed by previous chunks. Added to
         // each token's chunk-local frame so `local_frame` becomes a global index.
         let mut encoder_frame_base = 0usize;
+        // Beam runs a single decode over the full encoder output (per-chunk
+        // incremental beam emission is inconsistent because the surviving best
+        // path can change across chunk boundaries). Greedy stays per-chunk.
+        let is_beam = self.decoding.is_beam();
+        let mut encoder_frames: Vec<Array3<f32>> = Vec::new();
 
         while buffer_idx < total_frames {
             let chunk_end = (buffer_idx + CHUNK_SIZE).min(total_frames);
@@ -713,16 +757,30 @@ impl Nemotron {
             };
             self.encoder_cache = new_cache;
 
-            let mut new_tokens = self.decode_chunk_tokens(&encoded, enc_len as usize)?;
-            // Rebase chunk-local frame indices onto the global timeline.
-            for token in &mut new_tokens {
-                token.local_frame += encoder_frame_base;
+            let enc_frames = (enc_len as usize).min(encoded.shape()[2]);
+            if is_beam {
+                // Stash this chunk's real encoder frames for a single beam pass.
+                encoder_frames.push(encoded.slice(s![.., .., 0..enc_frames]).to_owned());
+            } else {
+                let mut new_tokens = self.decode_chunk_tokens(&encoded, enc_frames)?;
+                // Rebase chunk-local frame indices onto the global timeline.
+                for token in &mut new_tokens {
+                    token.local_frame += encoder_frame_base;
+                }
+                all_tokens.extend(new_tokens);
             }
-            all_tokens.extend(new_tokens);
 
-            encoder_frame_base += enc_len as usize;
+            encoder_frame_base += enc_frames;
             buffer_idx += CHUNK_SIZE;
             chunk_idx += 1;
+        }
+
+        if is_beam && !encoder_frames.is_empty() {
+            let views: Vec<_> = encoder_frames.iter().map(|f| f.view()).collect();
+            let full = ndarray::concatenate(ndarray::Axis(2), &views)
+                .map_err(|e| Error::Model(format!("Failed to concat encoder frames: {e}")))?;
+            let total = full.shape()[2];
+            all_tokens = self.decode_chunk_tokens(&full, total)?;
         }
 
         Ok(all_tokens)
@@ -840,8 +898,14 @@ impl Nemotron {
 
         let tokens = self.decode_chunk_tokens(&encoded, enc_len as usize)?;
         // Store all emitted ids unfiltered; `get_transcript` strips lang tags
-        // and out-of-vocab ids at read time.
-        self.accumulated_tokens.extend(tokens.iter().map(|t| t.id));
+        // and out-of-vocab ids at read time. In beam mode the per-chunk best
+        // path can change, so reset accumulated ids to the global best path
+        // instead of concatenating (possibly inconsistent) per-chunk emissions.
+        if self.decoding.is_beam() {
+            self.accumulated_tokens = self.beam_best_tokens.clone();
+        } else {
+            self.accumulated_tokens.extend(tokens.iter().map(|t| t.id));
+        }
 
         // Advance processed position
         self.audio_processed += CHUNK_SIZE * HOP_LENGTH;
@@ -862,6 +926,79 @@ impl Nemotron {
     }
 
     fn decode_chunk_tokens(
+        &mut self,
+        encoder_out: &Array3<f32>,
+        enc_frames: usize,
+    ) -> Result<Vec<TokenInfo>> {
+        match self.decoding {
+            DecodingStrategy::Greedy => self.decode_chunk_tokens_greedy(encoder_out, enc_frames),
+            DecodingStrategy::Beam(config) => {
+                self.decode_chunk_tokens_beam(encoder_out, enc_frames, config)
+            }
+        }
+    }
+
+    /// RNNT beam decode over one chunk's encoder frames, carrying hypotheses
+    /// across chunk boundaries (same cross-chunk pattern as ParakeetUnified).
+    fn decode_chunk_tokens_beam(
+        &mut self,
+        encoder_out: &Array3<f32>,
+        enc_frames: usize,
+        config: crate::decoding::BeamConfig,
+    ) -> Result<Vec<TokenInfo>> {
+        let blank_id = self.blank_id;
+        // Survivors from the previous chunk sit at its `end_frame`; remap to this
+        // chunk's local start (0) before continuing.
+        let mut input = std::mem::take(&mut self.beam_hypotheses);
+        for h in &mut input {
+            h.frame = 0;
+        }
+
+        let output = {
+            let mut model = self
+                .model
+                .lock()
+                .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
+            let mut decoder = |frame: &Array3<f32>,
+                               last_token: i32,
+                               s1: &Array3<f32>,
+                               s2: &Array3<f32>| {
+                model.run_decoder(frame, last_token, s1, s2)
+            };
+            decode_rnnt_beam(
+                encoder_out,
+                0,
+                enc_frames,
+                0,
+                blank_id,
+                &config,
+                input,
+                &mut decoder,
+            )?
+        };
+
+        self.beam_hypotheses = output.hypotheses;
+        if let Some(best) = output.best_hypothesis {
+            self.beam_best_tokens = best.tokens.iter().map(|(id, _)| *id).collect();
+            self.state_1 = best.state_1;
+            self.state_2 = best.state_2;
+            self.last_token = best.last_token;
+        }
+
+        // Beam scores are path-level; per-token logprob is not tracked, so report 0.
+        Ok(output
+            .new_tokens
+            .into_iter()
+            .map(|(id, frame)| TokenInfo {
+                id,
+                text: self.vocab.decode_single(id),
+                logprob: 0.0,
+                local_frame: frame,
+            })
+            .collect())
+    }
+
+    fn decode_chunk_tokens_greedy(
         &mut self,
         encoder_out: &Array3<f32>,
         enc_frames: usize,
