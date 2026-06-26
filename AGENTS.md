@@ -44,8 +44,13 @@ When a local experiment proves stable, propose it upstream as a small, focused P
 
 | Path | Status | Notes |
 |------|--------|-------|
+| `src/decoding/` | Added | Beam search module (`ctc_beam`, `tdt_beam`, `rnnt_beam`) + `DecodingStrategy`/`BeamConfig`; ported from parakeet-mlx defaults |
+| `src/parakeet.rs`, `src/parakeet_tdt.rs`, `src/parakeet_unified.rs`, `src/nemotron.rs`, `src/model_tdt.rs` | Modified | `from_pretrained_with_decoding` / `set_decoding_strategy` wiring for greedy-vs-beam |
+| `tests/model_benchmark.rs`, `tests/common/mod.rs` | Added | Model-backed WER/DER smoke + benchmark tests (skip gracefully when weights absent) |
+| `scripts/benchmark/` | Added | `run_all.sh`, `manifest.toml`, `compare_greedy_beam.py` greedy-vs-beam harness |
+| `plans/BEAM_SEARCH_IMPLEMENTATION_PLAN.md` | Added | Design notes for the beam search work |
 | `scripts/export_nemotron_streaming.py` | Modified | Export/latency documentation and `--right-context` presets |
-| `src/nemotron.rs` | Modified | Comment clarification for 560 ms chunk config |
+| `src/nemotron.rs` | Modified | 560 ms chunk config comment + beam decoding hook |
 | `scripts/quantize_nemotron_streaming.py` | Untracked | Local INT8/INT4 quantization tooling (candidate for upstream) |
 | `scripts/export_ultra_diar_8spk.py` | Untracked | 8-speaker Sortformer export |
 | `src/sortformer.rs` | Modified | Metadata-driven `num_speakers` (default 4); enables 8spk ONNX |
@@ -102,6 +107,8 @@ Optional Cargo features gate heavier modules: `sortformer`, `multitalker` (impli
 
 **Shared offline path:** `Transcriber` trait (`src/transcriber.rs`) → `audio::extract_features_with_cache` → model forward → decode → `timestamps::process_timestamps`.
 
+**Decoding strategy:** CTC, TDT, and Unified (RNNT) — plus Nemotron streaming — support optional **beam search** via `DecodingStrategy::Beam(BeamConfig)`. Greedy stays the default; opt in with `from_pretrained_with_decoding(...)` or `set_decoding_strategy(...)`. `BeamConfig` field applicability per family is documented in `src/decoding/mod.rs` (not all fields are honored by all decoders — e.g. `patience` is TDT-only, `length_penalty` is RNNT/TDT-only).
+
 **Example:** `examples/raw.rs` (CTC), `examples/unified.rs`, `examples/cohere.rs`.
 
 ### Streaming ASR
@@ -132,6 +139,7 @@ Post-processing: `DiarizationConfig` presets (`callhome()`, `dihard3()`, `custom
 |---------|----------|-------|
 | Audio load + mel/STFT | `src/audio.rs` | **Must use FFT** — naive DFT breaks models (comment at L70–73) |
 | Execution providers | `src/execution.rs` | `ExecutionProvider`, `CoreMLComputeUnits`, `ModelConfig::build_session()`; GPU EPs fall back to CPU |
+| Decoding strategy | `src/decoding/` | `DecodingStrategy` (Greedy default / Beam) + `BeamConfig`; per-family beam decoders (`ctc_beam`, `tdt_beam`, `rnnt_beam`). Opt in via `*_with_decoding` constructors or `set_decoding_strategy` |
 | Timestamps | `src/timestamps.rs`, `src/decoder.rs` | `TimestampMode`: Tokens / Words / Sentences |
 | ONNX tensor helpers | `src/tensor_utils.rs` | Flat/3D/4D f32 extraction from `ort` outputs |
 | Config structs | `src/config.rs` | `PreprocessorConfig`, `ModelConfig` (CTC defaults hardcoded) |
@@ -149,6 +157,8 @@ Post-processing: `DiarizationConfig` presets (`callhome()`, `dihard3()`, `custom
 | `scripts/export_multitalker.py` | Multitalker encoder/decoder export | `multitalker.rs` |
 | `scripts/export_diar_sortformer.py` | Sortformer 4spk with tunable chunk/FIFO/cache params | `sortformer.rs` constants (overridable via ONNX metadata) |
 | `scripts/export_ultra_diar_8spk.py` | 8-speaker Sortformer export | `sortformer.rs` reads `num_speakers` from ONNX metadata |
+| `scripts/benchmark/run_all.sh` | Greedy-vs-beam example harness (env-driven model/clip selection) | Drives `examples/*` with `--decoding greedy|beam` |
+| `scripts/benchmark/compare_greedy_beam.py` | Transcript edit-distance / optional WER diff for greedy vs beam | Consumed by `run_all.sh` |
 
 Cohere uses upstream Optimum export — no custom script in-repo (`cohere.rs` documents CLI).
 
@@ -216,7 +226,7 @@ flowchart LR
 | **CoreML** | Slower than CPU for dynamic-shape Parakeet graphs; use WebGPU or CPU on Apple (`execution.rs` L12–14, README) |
 | **WebGPU EP** | Marked experimental; may produce incorrect results |
 | **EOU reset-on-EOU** | Example notes poor real-world behavior (`examples/streaming.rs` L48–49) |
-| **Beam search** | Stub only — `decoder.rs` L199 falls back to greedy |
+| **Beam search** | Implemented in `src/decoding/` for CTC/TDT/RNNT + Nemotron; opt-in (`DecodingStrategy::Beam`). Greedy remains default. Not every `BeamConfig` field applies to every decoder (see `decoding/mod.rs` table) |
 | **Multilingual Nemotron langs** | Prompt dictionary embedded in `nemotron.rs`; 8 "adaptation-ready" langs need fine-tuning for production quality |
 | **Sortformer + multitalker** | Multitalker depends on Sortformer raw predictions for speaker masks |
 | **Threading** | Streaming handles use `Arc<Mutex<...>>` for ONNX sessions — avoid hot-path lock contention in multi-stream servers |
@@ -229,8 +239,11 @@ flowchart LR
 
 ### Testing
 
-- **No unit tests in tree** — CI runs `cargo test` but test coverage is minimal.
-- Validation is primarily manual via `examples/` with downloaded ONNX weights.
+- **Model-backed integration tests** live in `tests/model_benchmark.rs` (helpers in `tests/common/mod.rs`). They run real ONNX inference over `samples/`, compute WER/CER (ASR) and DER/JER (diarization), and write CSV reports under `samples/`.
+- **Weight-gated:** when models under `models/` (or `PARAKEET_*` env overrides) are missing, each test prints a skip notice and passes, so CI without weights stays green. The 20 s smoke clip is asserted when weights are present (`SMOKE_MAX_WER` ceiling, default 0.15).
+- Run: `cargo test --release --test model_benchmark --features "sortformer multitalker cohere" -- --nocapture`. Set `PARAKEET_BENCH_ALL=1` to include the long (~10–29 min) clips.
+- **Greedy-vs-beam harness:** `scripts/benchmark/run_all.sh` (config in `manifest.toml`) drives the examples in both decodings and diffs transcripts via `compare_greedy_beam.py`; all model dirs/clips are env-overridable and skip gracefully.
+- Validation is otherwise manual via `examples/` with downloaded ONNX weights.
 
 ---
 
@@ -241,8 +254,8 @@ flowchart LR
 | High | Upstream `quantize_nemotron_streaming.py` if stable | `scripts/` |
 | High | Runtime-configurable Nemotron chunk size (read from `config.json` export sidecar) | `nemotron.rs`, `model_nemotron.rs` |
 | High | Parameterize `NUM_SPEAKERS` in Sortformer (read from ONNX metadata, default 4) | **Done locally** — `sortformer.rs` |
-| Medium | Beam search with optional LM | `decoder.rs` TODO |
-| Medium | Integration tests with tiny fixture ONNX graphs | new `tests/` or `#[cfg(test)]` modules |
+| Medium | Beam search (CTC/TDT/RNNT) | **Done locally** — `src/decoding/`; remaining: optional LM rescoring, honor `patience`/`length_penalty` uniformly across families |
+| Medium | Model-backed WER/DER benchmark suite | **Done locally** — `tests/model_benchmark.rs` (real-weight, weight-gated). Remaining: tiny fixture ONNX graphs for weight-free CI |
 | Medium | Load CTC/TDT configs from JSON instead of hardcoding | `config.rs`, `model.rs` |
 | Low | CoreML graph rewriting for static shapes | `execution.rs` |
 | Low | Batch transcription API (currently sequential in `transcriber.rs`) | `Transcriber` trait |
@@ -268,10 +281,14 @@ parakeet-rs/
 │   ├── multitalker.rs      # Multi-speaker ASR [feature multitalker]
 │   ├── cohere.rs           # Cohere ASR [feature cohere]
 │   ├── model*.rs           # ONNX session wrappers
-│   ├── decoder*.rs         # CTC / TDT decoders
+│   ├── decoder*.rs         # CTC / TDT greedy decoders
+│   ├── decoding/           # Beam search: mod.rs (DecodingStrategy/BeamConfig) + ctc/tdt/rnnt_beam.rs
 │   └── timestamps.rs       # Token/word/sentence grouping
 ├── examples/               # Runnable demos (need local model dirs)
+├── tests/                  # model_benchmark.rs (weight-gated WER/DER) + common/mod.rs
 ├── scripts/                # NeMo → ONNX export (+ local quantize)
+│   └── benchmark/          # run_all.sh, manifest.toml, compare_greedy_beam.py
+├── plans/                  # Design docs (e.g. BEAM_SEARCH_IMPLEMENTATION_PLAN.md)
 └── .github/workflows/rust.yml
 ```
 

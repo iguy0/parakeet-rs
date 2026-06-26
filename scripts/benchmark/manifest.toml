@@ -16,6 +16,9 @@
 PARAKEET_MODELS_ROOT = "."          # else use absolute *_DIR overrides below
 BEAM_SIZE            = "5"          # beam width for the beam runs
 OUT_DIR              = "scripts/benchmark/results"
+CARGO_FEATURES       = ""           # e.g. webgpu (requires matching ort EP feature)
+PARAKEET_EP          = "cpu"        # execution provider: cpu | webgpu | cuda | directml
+PARAKEET_WEBGPU_DEVICE_ID = ""      # optional GPU index when PARAKEET_EP=webgpu
 
 # Per-model directories (skipped if missing). Layouts per AGENTS.md section 6.
 [models.ctc]

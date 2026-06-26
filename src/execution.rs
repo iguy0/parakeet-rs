@@ -57,12 +57,16 @@ pub struct ModelConfig {
     /// Only used when execution_provider is CoreML.
     pub coreml_cache_dir: Option<PathBuf>,
     pub coreml_compute_units: CoreMLComputeUnits,
+    /// GPU device index for the WebGPU EP (`ort::ep::WebGPU::with_device_id`).
+    /// Only used when execution_provider is WebGPU.
+    #[cfg(feature = "webgpu")]
+    pub webgpu_device_id: Option<i32>,
 }
 
 impl fmt::Debug for ModelConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ModelConfig")
-            .field("execution_provider", &self.execution_provider)
+        let mut dbg = f.debug_struct("ModelConfig");
+        dbg.field("execution_provider", &self.execution_provider)
             .field("intra_threads", &self.intra_threads)
             .field("inter_threads", &self.inter_threads)
             .field(
@@ -74,8 +78,10 @@ impl fmt::Debug for ModelConfig {
                 },
             )
             .field("coreml_cache_dir", &self.coreml_cache_dir)
-            .field("coreml_compute_units", &self.coreml_compute_units)
-            .finish()
+            .field("coreml_compute_units", &self.coreml_compute_units);
+        #[cfg(feature = "webgpu")]
+        dbg.field("webgpu_device_id", &self.webgpu_device_id);
+        dbg.finish()
     }
 }
 
@@ -88,6 +94,8 @@ impl Default for ModelConfig {
             configure: None,
             coreml_cache_dir: None,
             coreml_compute_units: CoreMLComputeUnits::default(),
+            #[cfg(feature = "webgpu")]
+            webgpu_device_id: None,
         }
     }
 }
@@ -133,6 +141,14 @@ impl ModelConfig {
         self.coreml_compute_units = units;
         self
     }
+
+    /// Select the GPU device for the WebGPU execution provider.
+    #[cfg(feature = "webgpu")]
+    pub fn with_webgpu_device_id(mut self, device_id: i32) -> Self {
+        self.webgpu_device_id = Some(device_id);
+        self
+    }
+
     pub(crate) fn build_session(&self, path: &Path) -> Result<Session> {
         let builder = Session::builder()?;
         let mut builder = self.apply_to_session_builder(builder)?;
@@ -160,6 +176,21 @@ impl ModelConfig {
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(self.intra_threads)?
             .with_inter_threads(self.inter_threads)?;
+
+        // WebGPU and DirectML require sequential session execution and disabled
+        // memory patterns (ORT DirectML docs; see transcribe-rs session setup).
+        let needs_sequential_session = match self.execution_provider {
+            #[cfg(feature = "webgpu")]
+            ExecutionProvider::WebGPU => true,
+            #[cfg(feature = "directml")]
+            ExecutionProvider::DirectML => true,
+            _ => false,
+        };
+        if needs_sequential_session {
+            builder = builder
+                .with_parallel_execution(false)?
+                .with_memory_pattern(false)?;
+        }
 
         builder = match self.execution_provider {
             ExecutionProvider::Cpu => builder,
@@ -216,10 +247,16 @@ impl ModelConfig {
             ])?,
 
             #[cfg(feature = "webgpu")]
-            ExecutionProvider::WebGPU => builder.with_execution_providers([
-                ort::ep::WebGPU::default().build(),
-                CPUExecutionProvider::default().build().error_on_failure(),
-            ])?,
+            ExecutionProvider::WebGPU => {
+                let mut ep = ort::ep::WebGPU::default();
+                if let Some(id) = self.webgpu_device_id {
+                    ep = ep.with_device_id(id);
+                }
+                builder.with_execution_providers([
+                    ep.build(),
+                    CPUExecutionProvider::default().build().error_on_failure(),
+                ])?
+            }
 
             #[cfg(feature = "nnapi")]
             ExecutionProvider::NNAPI => builder.with_execution_providers([

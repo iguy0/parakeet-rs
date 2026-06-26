@@ -67,6 +67,9 @@ fn run_asr_bench(
     ceiling: f32,
     mut run: impl FnMut(&[f32]) -> (String, f32),
 ) {
+    if ep_skip_if_unavailable(test) {
+        return;
+    }
     let samples = selected_asr_samples();
     assert!(
         samples.iter().any(|s| s.name == "smoke"),
@@ -80,7 +83,17 @@ fn run_asr_bench(
         let audio_secs = audio.len() as f32 / 16_000.0;
         let (hyp, proc_secs) = run(&audio);
         let reference = reference_for(sample);
-        let w = record_asr(&sample.name, model, mode, decoding, audio_secs, proc_secs, &reference, &hyp);
+        let w = record_asr(
+            &sample.name,
+            model,
+            mode,
+            decoding,
+            &requested_ep(),
+            audio_secs,
+            proc_secs,
+            &reference,
+            &hyp,
+        );
         if sample.name == "smoke" {
             assert!(!hyp.trim().is_empty(), "{test}: smoke transcript was empty");
             smoke_wer = Some(w);
@@ -113,7 +126,8 @@ fn nemotron_streaming_wer() {
         smoke_max_wer(),
         |audio| {
             let mut model =
-                parakeet_rs::Nemotron::from_pretrained(nemotron_dir(), None).expect("load nemotron");
+                parakeet_rs::Nemotron::from_pretrained(nemotron_dir(), Some(execution_config()))
+                    .expect("load nemotron");
             let t0 = std::time::Instant::now();
             let mut buf = audio.to_vec();
             peak_normalize(&mut buf);
@@ -140,8 +154,16 @@ fn sortformer_diarization_smoke() {
         return;
     };
 
+    if ep_skip_if_unavailable("sortformer_diarization_smoke") {
+        return;
+    }
+
     let (audio, sample_rate) = load_wav_mono_16k(&sample.wav);
-    let mut sf = Sortformer::with_config(sortformer_onnx(), None, DiarizationConfig::callhome())
+    let mut sf = Sortformer::with_config(
+        sortformer_onnx(),
+        Some(execution_config()),
+        DiarizationConfig::callhome(),
+    )
         .expect("load sortformer");
 
     let segments = sf.diarize(audio, sample_rate, 1).expect("diarize");
@@ -203,7 +225,11 @@ fn nemotron_decoding_matrix() {
             dlabel,
             smoke_max_wer(),
             |audio| {
-                let mut m = Nemotron::from_pretrained_with_decoding(nemotron_dir(), None, decoding)
+                let mut m = Nemotron::from_pretrained_with_decoding(
+                    nemotron_dir(),
+                    Some(execution_config()),
+                    decoding,
+                )
                     .expect("load nemotron");
                 let mut buf = audio.to_vec();
                 peak_normalize(&mut buf);
@@ -221,7 +247,11 @@ fn nemotron_decoding_matrix() {
             dlabel,
             smoke_max_wer(),
             |audio| {
-                let mut m = Nemotron::from_pretrained_with_decoding(nemotron_dir(), None, decoding)
+                let mut m = Nemotron::from_pretrained_with_decoding(
+                    nemotron_dir(),
+                    Some(execution_config()),
+                    decoding,
+                )
                     .expect("load nemotron");
                 let mut buf = audio.to_vec();
                 peak_normalize(&mut buf);
@@ -254,7 +284,11 @@ fn ctc_offline_wer() {
         (DecodingStrategy::Beam(BeamConfig::default_ctc()), "beam"),
     ] {
         run_asr_bench("ctc_offline_wer", "parakeet-ctc", "offline", label, smoke_max_wer(), |audio| {
-            let mut m = Parakeet::from_pretrained_with_decoding(ctc_dir(), None, decoding)
+            let mut m = Parakeet::from_pretrained_with_decoding(
+                ctc_dir(),
+                Some(execution_config()),
+                decoding,
+            )
                 .expect("load ctc");
             offline_transcribe(&mut m, audio)
         });
@@ -273,7 +307,11 @@ fn tdt_offline_wer() {
         (DecodingStrategy::Beam(BeamConfig::default_tdt()), "beam"),
     ] {
         run_asr_bench("tdt_offline_wer", "parakeet-tdt", "offline", label, smoke_max_wer(), |audio| {
-            let mut m = ParakeetTDT::from_pretrained_with_decoding(tdt_dir(), None, decoding)
+            let mut m = ParakeetTDT::from_pretrained_with_decoding(
+                tdt_dir(),
+                Some(execution_config()),
+                decoding,
+            )
                 .expect("load tdt");
             offline_transcribe(&mut m, audio)
         });
@@ -306,7 +344,7 @@ fn unified_offline_and_streaming_wer() {
             |audio| {
                 let mut m = ParakeetUnified::from_pretrained_with_decoding(
                     unified_dir(),
-                    None,
+                    Some(execution_config()),
                     Default::default(),
                     decoding,
                 )
@@ -325,7 +363,7 @@ fn unified_offline_and_streaming_wer() {
             |audio| {
                 let mut m = ParakeetUnified::from_pretrained_with_decoding(
                     unified_dir(),
-                    None,
+                    Some(execution_config()),
                     Default::default(),
                     decoding,
                 )
@@ -356,7 +394,7 @@ fn eou_streaming_wer() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.4);
     run_asr_bench("eou_streaming_wer", "realtime-eou-120m", "streaming", "greedy", ceiling, |audio| {
-        let mut m = ParakeetEOU::from_pretrained(eou_dir(), None).expect("load eou");
+        let mut m = ParakeetEOU::from_pretrained(eou_dir(), Some(execution_config())).expect("load eou");
         let chunk = 2560; // 160 ms
         let t0 = Instant::now();
         let mut text = String::new();
@@ -383,7 +421,7 @@ fn cohere_offline_wer() {
         return;
     }
     run_asr_bench("cohere_offline_wer", "cohere-transcribe-int8", "offline", "greedy", smoke_max_wer(), |audio| {
-        let mut m = CohereASR::from_pretrained(cohere_dir(), None).expect("load cohere");
+        let mut m = CohereASR::from_pretrained(cohere_dir(), Some(execution_config())).expect("load cohere");
         let t0 = Instant::now();
         let text = m.transcribe_audio(audio, "en", true, false).expect("cohere transcribe");
         (text, t0.elapsed().as_secs_f32())
@@ -406,6 +444,10 @@ fn diarization_benchmark_report() {
             "diarization_benchmark_report",
             &format!("model not found at {}", sortformer_onnx().display()),
         );
+        return;
+    }
+
+    if ep_skip_if_unavailable("diarization_benchmark_report") {
         return;
     }
 
@@ -439,8 +481,11 @@ num_ref_speakers,num_hyp_speakers,der,missed,false_alarm,confusion,jer";
         let (audio, sample_rate) = load_wav_mono_16k(&sample.wav);
         let audio_secs = audio.len() as f32 / 16_000.0;
 
-        let mut sf =
-            Sortformer::with_config(sortformer_onnx(), None, DiarizationConfig::callhome())
+        let mut sf = Sortformer::with_config(
+            sortformer_onnx(),
+            Some(execution_config()),
+            DiarizationConfig::callhome(),
+        )
                 .expect("load sortformer");
 
         let t0 = Instant::now();
@@ -527,8 +572,15 @@ fn sortformer_streaming_smoke() {
         return;
     };
 
+    if ep_skip_if_unavailable("sortformer_streaming_smoke") {
+        return;
+    }
     let (audio, _) = load_wav_mono_16k(&sample.wav);
-    let mut sf = Sortformer::with_config(sortformer_onnx(), None, DiarizationConfig::callhome())
+    let mut sf = Sortformer::with_config(
+        sortformer_onnx(),
+        Some(execution_config()),
+        DiarizationConfig::callhome(),
+    )
         .expect("load sortformer");
 
     let chunk = 16_000; // 1 s
@@ -576,11 +628,18 @@ fn multitalker_smoke() {
         return;
     };
 
+    if ep_skip_if_unavailable("multitalker_smoke") {
+        return;
+    }
     let (mut audio, _) = load_wav_mono_16k(&sample.wav);
     let audio_secs = audio.len() as f32 / 16_000.0;
     peak_normalize(&mut audio);
 
-    let mut model = MultitalkerASR::from_pretrained(multitalker_dir(), sortformer_onnx(), None)
+    let mut model = MultitalkerASR::from_pretrained(
+        multitalker_dir(),
+        sortformer_onnx(),
+        Some(execution_config()),
+    )
         .expect("load multitalker");
 
     let chunk = model.chunk_audio_samples();
@@ -612,6 +671,7 @@ fn multitalker_smoke() {
         "multitalker-0.6b-int8",
         "streaming",
         "greedy",
+        &requested_ep(),
         audio_secs,
         proc_secs,
         &reference,
@@ -629,5 +689,179 @@ fn multitalker_smoke() {
     assert!(
         total_chars > 0,
         "expected non-empty multitalker transcription on a 20s speech clip"
+    );
+}
+
+// --- WebGPU CPU parity (Phase 4) -----------------------------------------
+
+fn webgpu_max_wer_delta() -> f32 {
+    std::env::var("PARAKEET_WEBGPU_MAX_WER_DELTA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.05)
+}
+
+/// Compare CPU vs WebGPU WER on the smoke clip for one model configuration.
+/// Records both runs to `asr_report.csv` with `ep=cpu` / `ep=webgpu`.
+/// On WebGPU inference failure, prints a skip notice (known upstream issues on
+/// some graphs — see `plans/WEBGPU_IMPLEMENTATION_PLAN.md` section 4).
+fn assert_cpu_webgpu_wer_parity(
+    test: &str,
+    model: &str,
+    mode: &str,
+    decoding: &str,
+    reference: &str,
+    audio_secs: f32,
+    transcribe: impl Fn(&parakeet_rs::ExecutionConfig) -> Result<(String, f32), String>,
+) {
+    let max_delta = webgpu_max_wer_delta();
+
+    let cpu_cfg = execution_config_for_ep("cpu");
+    let (hyp_cpu, proc_cpu) = match transcribe(&cpu_cfg) {
+        Ok(v) => v,
+        Err(e) => panic!("{test}: CPU transcribe failed: {e}"),
+    };
+    let wer_cpu = record_asr(
+        "smoke",
+        model,
+        mode,
+        decoding,
+        "cpu",
+        audio_secs,
+        proc_cpu,
+        reference,
+        &hyp_cpu,
+    );
+
+    let gpu_cfg = execution_config_for_ep("webgpu");
+    match transcribe(&gpu_cfg) {
+        Ok((hyp_gpu, proc_gpu)) => {
+            let wer_gpu = record_asr(
+                "smoke",
+                model,
+                mode,
+                decoding,
+                "webgpu",
+                audio_secs,
+                proc_gpu,
+                reference,
+                &hyp_gpu,
+            );
+            let delta = (wer_gpu - wer_cpu).abs();
+            eprintln!(
+                "\n[{test}] CPU WER {:.1}%  WebGPU WER {:.1}%  delta {:.1}% (max {:.1}%)",
+                wer_cpu * 100.0,
+                wer_gpu * 100.0,
+                delta * 100.0,
+                max_delta * 100.0
+            );
+            assert!(
+                delta <= max_delta,
+                "{test}: |WER_webgpu - WER_cpu| = {:.1}% exceeds PARAKEET_WEBGPU_MAX_WER_DELTA \
+({:.1}%). Set PARAKEET_WEBGPU_MAX_WER_DELTA to adjust.",
+                delta * 100.0,
+                max_delta * 100.0
+            );
+        }
+        Err(e) => {
+            skip(
+                test,
+                &format!(
+                    "WebGPU transcribe failed ({e}); see plans/WEBGPU_IMPLEMENTATION_PLAN.md \
+section 4 (known ORT WebGPU issues on some graphs, e.g. Nemotron Slice on ort rc.12 Linux/Vulkan)"
+                ),
+            );
+        }
+    }
+}
+
+/// CPU vs WebGPU WER parity on the smoke clip. CTC offline is the primary P0
+/// target; Nemotron streaming is optional (may segfault on ort rc.12 — opt in
+/// with `PARAKEET_WEBGPU_NEMOTRON_PARITY=1`).
+#[cfg(feature = "webgpu")]
+#[test]
+fn webgpu_cpu_wer_parity_smoke() {
+    let Some(sample) = sample_named("smoke") else {
+        skip("webgpu_cpu_wer_parity_smoke", "samples/smoke missing");
+        return;
+    };
+
+    let (audio, _) = load_wav_mono_16k(&sample.wav);
+    let audio_secs = audio.len() as f32 / 16_000.0;
+    let reference = reference_for(&sample);
+
+    if ctc_available() {
+        eprintln!("\n[webgpu_cpu_wer_parity_smoke] CTC offline (P0):");
+        let audio = audio.clone();
+        let reference = reference.clone();
+        assert_cpu_webgpu_wer_parity(
+            "webgpu_cpu_wer_parity_smoke/ctc",
+            "parakeet-ctc",
+            "offline",
+            "greedy",
+            &reference,
+            audio_secs,
+            |cfg| {
+                use parakeet_rs::Parakeet;
+                let mut m = Parakeet::from_pretrained_with_decoding(
+                    ctc_dir(),
+                    Some(cfg.clone()),
+                    DecodingStrategy::Greedy,
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(offline_transcribe(&mut m, &audio))
+            },
+        );
+    } else {
+        skip(
+            "webgpu_cpu_wer_parity_smoke/ctc",
+            &format!("CTC model not found at {}", ctc_dir().display()),
+        );
+    }
+
+    let nemotron_parity = std::env::var("PARAKEET_WEBGPU_NEMOTRON_PARITY")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    if !nemotron_parity {
+        skip(
+            "webgpu_cpu_wer_parity_smoke/nemotron",
+            "set PARAKEET_WEBGPU_NEMOTRON_PARITY=1 to run (may segfault on ort rc.12 Linux/Vulkan)",
+        );
+        return;
+    }
+    if !nemotron_available() {
+        skip(
+            "webgpu_cpu_wer_parity_smoke/nemotron",
+            &format!("model not found at {}", nemotron_dir().display()),
+        );
+        return;
+    }
+
+    eprintln!("\n[webgpu_cpu_wer_parity_smoke] Nemotron streaming (P0, opt-in):");
+    let mut buf = audio;
+    peak_normalize(&mut buf);
+    assert_cpu_webgpu_wer_parity(
+        "webgpu_cpu_wer_parity_smoke/nemotron",
+        "nemotron-en-0.6b-int8",
+        "streaming",
+        "greedy",
+        &reference,
+        audio_secs,
+        |cfg| {
+            let mut m = parakeet_rs::Nemotron::from_pretrained(nemotron_dir(), Some(cfg.clone()))
+                .map_err(|e| e.to_string())?;
+            let t0 = Instant::now();
+            let hyp = nemotron_transcribe(&mut m, &buf);
+            Ok((hyp, t0.elapsed().as_secs_f32()))
+        },
+    );
+}
+
+#[cfg(not(feature = "webgpu"))]
+#[test]
+fn webgpu_cpu_wer_parity_smoke() {
+    skip(
+        "webgpu_cpu_wer_parity_smoke",
+        "requires `cargo test --features webgpu`",
     );
 }

@@ -23,6 +23,26 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+  webgpu-build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Build with WebGPU feature
+      run: cargo build --verbose --features webgpu
+    - name: Run library unit tests (no model weights)
+      run: cargo test --verbose --features webgpu --lib
+
+  webgpu-build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Build with WebGPU feature
+      run: cargo build --verbose --features webgpu
+
   release:
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')

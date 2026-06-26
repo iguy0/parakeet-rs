@@ -9,6 +9,7 @@ cargo run --example raw 6_speakers.wav
 cargo run --example raw 6_speakers.wav -- --decoding beam --beam-size 5
 cargo run --example raw 6_speakers.wav tdt
 cargo run --example raw 6_speakers.wav tdt -- --decoding beam --beam-size 5
+cargo run --features webgpu --example raw 6_speakers.wav -- --ep webgpu
 
 WARNING: TDT model has sequence length limitations (~8-10 minutes max).
 For longer audio files, you must split into chunks (e.g., 5-minute segments)
@@ -18,9 +19,67 @@ Otherwise you will likely get a error like:
 "Error: Ort(Error { code: RuntimeException, msg: "Non-zero status code returned while running Add node. Name:'/layers.0/self_attn/Add_2' Status Message: /Users/runner/work/ort-artifacts/ort-artifacts/onnxruntime/onnxruntime/core/providers/cpu/math/element_wise_ops.h:540 void onnxruntime::BroadcastIterator::Init(ptrdiff_t, ptrdiff_t) axis == 1 || axis == largest was false. })"
 */
 
-use parakeet_rs::{BeamConfig, DecodingStrategy, Parakeet, ParakeetTDT, TimestampMode, Transcriber};
+use parakeet_rs::{
+    BeamConfig, DecodingStrategy, ExecutionConfig, ExecutionProvider, Parakeet, ParakeetTDT,
+    TimestampMode, Transcriber,
+};
 use std::env;
 use std::time::Instant;
+
+/// Build execution config from `--ep <name>` (after `--`) or `PARAKEET_EP` env (default: cpu).
+fn parse_execution_config(flag_args: &[String]) -> Option<ExecutionConfig> {
+    let ep_name = flag_args
+        .windows(2)
+        .find(|w| w[0] == "--ep")
+        .map(|w| w[1].clone())
+        .or_else(|| std::env::var("PARAKEET_EP").ok())
+        .unwrap_or_else(|| "cpu".to_string())
+        .to_ascii_lowercase();
+
+    let mut cfg = ExecutionConfig::new();
+    match ep_name.as_str() {
+        "cpu" | "" => {}
+        #[cfg(feature = "webgpu")]
+        "webgpu" => {
+            cfg = cfg.with_execution_provider(ExecutionProvider::WebGPU);
+            if let Ok(id_str) = std::env::var("PARAKEET_WEBGPU_DEVICE_ID") {
+                if let Ok(id) = id_str.parse::<i32>() {
+                    cfg = cfg.with_webgpu_device_id(id);
+                }
+            }
+            eprintln!("[execution provider: webgpu]");
+        }
+        #[cfg(not(feature = "webgpu"))]
+        "webgpu" => {
+            eprintln!("Warning: --ep webgpu ignored (rebuild with --features webgpu)");
+        }
+        #[cfg(feature = "cuda")]
+        "cuda" => {
+            cfg = cfg.with_execution_provider(ExecutionProvider::Cuda);
+            eprintln!("[execution provider: cuda]");
+        }
+        #[cfg(not(feature = "cuda"))]
+        "cuda" => {
+            eprintln!("Warning: --ep cuda ignored (rebuild with --features cuda)");
+        }
+        #[cfg(feature = "directml")]
+        "directml" => {
+            cfg = cfg.with_execution_provider(ExecutionProvider::DirectML);
+            eprintln!("[execution provider: directml]");
+        }
+        #[cfg(not(feature = "directml"))]
+        "directml" => {
+            eprintln!("Warning: --ep directml ignored (rebuild with --features directml)");
+        }
+        other => eprintln!("Warning: unknown execution provider '{other}', using cpu"),
+    }
+
+    if ep_name == "cpu" || ep_name.is_empty() {
+        None
+    } else {
+        Some(cfg)
+    }
+}
 
 fn parse_decoding(args: &[String], default_beam: fn() -> BeamConfig) -> DecodingStrategy {
     let mut use_beam = false;
@@ -92,6 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .skip(1)
         .cloned()
         .collect();
+    let exec_config = parse_execution_config(&flag_args);
 
     if use_tdt {
         let decoding = parse_decoding(&flag_args, BeamConfig::default_tdt);
@@ -103,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         }
         let mut parakeet =
-            ParakeetTDT::from_pretrained_with_decoding("./tdt", None, decoding)?;
+            ParakeetTDT::from_pretrained_with_decoding("./tdt", exec_config.clone(), decoding)?;
 
         // Use transcribe_samples() with raw parameters and timestamp mode
         let result = parakeet.transcribe_samples(
@@ -130,7 +190,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 c.beam_size
             ),
         }
-        let mut parakeet = Parakeet::from_pretrained_with_decoding(".", None, decoding)?;
+        let mut parakeet =
+            Parakeet::from_pretrained_with_decoding(".", exec_config.clone(), decoding)?;
 
         // CTC model doesn't predict punctuation (lowercase alphabet only)
         // This means no sentence boundaries. we use Words mode instead of Sentences

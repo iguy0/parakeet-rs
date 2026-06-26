@@ -12,6 +12,7 @@ Examples:
   cargo run --release --example streaming DENIZ.wav tr-TR           # Turkish hint
   cargo run --release --example streaming clip.wav  auto            # let the model pick the lang
   cargo run --release --example streaming 6_speakers.wav eou        # EOU model instead of Nemotron
+  cargo run --features webgpu --release --example streaming clip.wav -- --ep webgpu
 
 Any 2nd arg that is not literally `eou` is treated as a target language code
 (`en-US`, `es-ES`, `ja-JP`, `tr-TR`, `auto`, etc. see prompt_dictionary in
@@ -49,10 +50,65 @@ let reset_on_eou: bool = false;
 I must admit that this is not work very well on my real world tests :/
 */
 
-use parakeet_rs::{Nemotron, NemotronMode, ParakeetEOU};
+use parakeet_rs::{ExecutionConfig, ExecutionProvider, Nemotron, NemotronMode, ParakeetEOU};
 use std::env;
 use std::io::Write;
 use std::time::Instant;
+
+/// Build execution config from `--ep <name>` (after `--`) or `PARAKEET_EP` env (default: cpu).
+fn parse_execution_config(flag_args: &[String]) -> Option<ExecutionConfig> {
+    let ep_name = flag_args
+        .windows(2)
+        .find(|w| w[0] == "--ep")
+        .map(|w| w[1].clone())
+        .or_else(|| std::env::var("PARAKEET_EP").ok())
+        .unwrap_or_else(|| "cpu".to_string())
+        .to_ascii_lowercase();
+
+    let mut cfg = ExecutionConfig::new();
+    match ep_name.as_str() {
+        "cpu" | "" => {}
+        #[cfg(feature = "webgpu")]
+        "webgpu" => {
+            cfg = cfg.with_execution_provider(ExecutionProvider::WebGPU);
+            if let Ok(id_str) = std::env::var("PARAKEET_WEBGPU_DEVICE_ID") {
+                if let Ok(id) = id_str.parse::<i32>() {
+                    cfg = cfg.with_webgpu_device_id(id);
+                }
+            }
+            eprintln!("[execution provider: webgpu]");
+        }
+        #[cfg(not(feature = "webgpu"))]
+        "webgpu" => {
+            eprintln!("Warning: --ep webgpu ignored (rebuild with --features webgpu)");
+        }
+        #[cfg(feature = "cuda")]
+        "cuda" => {
+            cfg = cfg.with_execution_provider(ExecutionProvider::Cuda);
+            eprintln!("[execution provider: cuda]");
+        }
+        #[cfg(not(feature = "cuda"))]
+        "cuda" => {
+            eprintln!("Warning: --ep cuda ignored (rebuild with --features cuda)");
+        }
+        #[cfg(feature = "directml")]
+        "directml" => {
+            cfg = cfg.with_execution_provider(ExecutionProvider::DirectML);
+            eprintln!("[execution provider: directml]");
+        }
+        #[cfg(not(feature = "directml"))]
+        "directml" => {
+            eprintln!("Warning: --ep directml ignored (rebuild with --features directml)");
+        }
+        other => eprintln!("Warning: unknown execution provider '{other}', using cpu"),
+    }
+
+    if ep_name == "cpu" || ep_name.is_empty() {
+        None
+    } else {
+        Some(cfg)
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
@@ -74,6 +130,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    let flag_args: Vec<String> = args
+        .iter()
+        .skip_while(|a| *a != "--")
+        .skip(1)
+        .cloned()
+        .collect();
+    let exec_config = parse_execution_config(&flag_args);
 
     // Load audio
     let mut reader = hound::WavReader::open(audio_path)?;
@@ -110,7 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if use_eou {
         // EOU model
-        let mut model = ParakeetEOU::from_pretrained("./fullstr", None)?;
+        let mut model = ParakeetEOU::from_pretrained("./fullstr", exec_config.clone())?;
         let chunk_size = 2560; // 160ms
 
         print!("Streaming: ");
@@ -158,7 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         "./nemotron_multi"
     };
-    let mut model = Nemotron::from_pretrained(model_dir, None)?;
+    let mut model = Nemotron::from_pretrained(model_dir, exec_config)?;
     let chunk_size = 8960; // 560ms
 
     match model.mode() {

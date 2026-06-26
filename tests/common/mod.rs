@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 pub const NEMOTRON_DIR_ENV: &str = "PARAKEET_NEMOTRON_DIR";
 pub const MULTITALKER_DIR_ENV: &str = "PARAKEET_MULTITALKER_DIR";
 pub const SORTFORMER_ONNX_ENV: &str = "PARAKEET_SORTFORMER_ONNX";
+pub const EP_ENV: &str = "PARAKEET_EP";
+pub const WEBGPU_DEVICE_ID_ENV: &str = "PARAKEET_WEBGPU_DEVICE_ID";
 
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -620,7 +622,145 @@ pub fn bench_label() -> String {
     std::env::var("PARAKEET_BENCH_LABEL").unwrap_or_default()
 }
 
-pub const ASR_CSV_HEADER: &str = "run_id,label,sample,model,mode,decoding,\
+/// Normalized `PARAKEET_EP` value (`cpu` when unset).
+pub fn requested_ep() -> String {
+    std::env::var(EP_ENV)
+        .unwrap_or_else(|_| "cpu".to_string())
+        .to_ascii_lowercase()
+}
+
+/// Skip when `PARAKEET_EP` requests an EP that was not compiled in.
+pub fn ep_skip_if_unavailable(test: &str) -> bool {
+    match requested_ep().as_str() {
+        "cpu" | "" => false,
+        #[cfg(not(feature = "webgpu"))]
+        "webgpu" => {
+            skip(
+                test,
+                &format!("{EP_ENV}=webgpu requires `cargo test --features webgpu`"),
+            );
+            true
+        }
+        #[cfg(feature = "webgpu")]
+        "webgpu" => false,
+        #[cfg(not(feature = "cuda"))]
+        "cuda" => {
+            skip(test, &format!("{EP_ENV}=cuda requires `cargo test --features cuda`"));
+            true
+        }
+        #[cfg(feature = "cuda")]
+        "cuda" => false,
+        #[cfg(not(feature = "directml"))]
+        "directml" => {
+            skip(
+                test,
+                &format!("{EP_ENV}=directml requires `cargo test --features directml`"),
+            );
+            true
+        }
+        #[cfg(feature = "directml")]
+        "directml" => false,
+        #[cfg(not(feature = "coreml"))]
+        "coreml" => {
+            skip(
+                test,
+                &format!("{EP_ENV}=coreml requires `cargo test --features coreml`"),
+            );
+            true
+        }
+        #[cfg(feature = "coreml")]
+        "coreml" => false,
+        #[cfg(not(feature = "tensorrt"))]
+        "tensorrt" => {
+            skip(
+                test,
+                &format!("{EP_ENV}=tensorrt requires `cargo test --features tensorrt`"),
+            );
+            true
+        }
+        #[cfg(feature = "tensorrt")]
+        "tensorrt" => false,
+        #[cfg(not(feature = "migraphx"))]
+        "migraphx" => {
+            skip(
+                test,
+                &format!("{EP_ENV}=migraphx requires `cargo test --features migraphx`"),
+            );
+            true
+        }
+        #[cfg(feature = "migraphx")]
+        "migraphx" => false,
+        #[cfg(not(feature = "openvino"))]
+        "openvino" => {
+            skip(
+                test,
+                &format!("{EP_ENV}=openvino requires `cargo test --features openvino`"),
+            );
+            true
+        }
+        #[cfg(feature = "openvino")]
+        "openvino" => false,
+        other => {
+            skip(test, &format!("unknown {EP_ENV}={other}"));
+            true
+        }
+    }
+}
+
+/// Build [`parakeet_rs::ExecutionConfig`] for an explicit EP name (`cpu`, `webgpu`, …).
+pub fn execution_config_for_ep(ep: &str) -> parakeet_rs::ExecutionConfig {
+    use parakeet_rs::{ExecutionConfig, ExecutionProvider};
+
+    let ep = ep.to_ascii_lowercase();
+    let mut cfg = ExecutionConfig::new();
+    match ep.as_str() {
+        "cpu" | "" => cfg,
+        #[cfg(feature = "webgpu")]
+        "webgpu" => {
+            cfg = cfg.with_execution_provider(ExecutionProvider::WebGPU);
+            if let Ok(id_str) = std::env::var(WEBGPU_DEVICE_ID_ENV) {
+                if let Ok(id) = id_str.parse::<i32>() {
+                    cfg = cfg.with_webgpu_device_id(id);
+                }
+            }
+            cfg
+        }
+        #[cfg(not(feature = "webgpu"))]
+        "webgpu" => cfg,
+        #[cfg(feature = "cuda")]
+        "cuda" => cfg.with_execution_provider(ExecutionProvider::Cuda),
+        #[cfg(not(feature = "cuda"))]
+        "cuda" => cfg,
+        #[cfg(feature = "directml")]
+        "directml" => cfg.with_execution_provider(ExecutionProvider::DirectML),
+        #[cfg(not(feature = "directml"))]
+        "directml" => cfg,
+        #[cfg(feature = "coreml")]
+        "coreml" => cfg.with_execution_provider(ExecutionProvider::CoreML),
+        #[cfg(not(feature = "coreml"))]
+        "coreml" => cfg,
+        #[cfg(feature = "tensorrt")]
+        "tensorrt" => cfg.with_execution_provider(ExecutionProvider::TensorRT),
+        #[cfg(not(feature = "tensorrt"))]
+        "tensorrt" => cfg,
+        #[cfg(feature = "migraphx")]
+        "migraphx" => cfg.with_execution_provider(ExecutionProvider::MIGraphX),
+        #[cfg(not(feature = "migraphx"))]
+        "migraphx" => cfg,
+        #[cfg(feature = "openvino")]
+        "openvino" => cfg.with_execution_provider(ExecutionProvider::OpenVINO),
+        #[cfg(not(feature = "openvino"))]
+        "openvino" => cfg,
+        _ => cfg,
+    }
+}
+
+/// Build [`parakeet_rs::ExecutionConfig`] from `PARAKEET_EP` (default: CPU).
+pub fn execution_config() -> parakeet_rs::ExecutionConfig {
+    execution_config_for_ep(&requested_ep())
+}
+
+pub const ASR_CSV_HEADER: &str = "run_id,label,sample,model,mode,decoding,ep,\
 audio_secs,proc_secs,rtf,wer,cer";
 
 /// Record one ASR result to `samples/asr_report.csv`, print a row, and return WER.
@@ -630,6 +770,7 @@ pub fn record_asr(
     model: &str,
     mode: &str,
     decoding: &str,
+    ep: &str,
     audio_secs: f32,
     proc_secs: f32,
     reference: &str,
@@ -639,10 +780,11 @@ pub fn record_asr(
     let c = cer(reference, hyp);
     let rtf = if proc_secs > 1e-6 { audio_secs / proc_secs } else { 0.0 };
     eprintln!(
-        "  {:<26} {:<9} {:<6} RTF {:>6.1}x  WER {:>5.1}%  CER {:>5.1}%",
+        "  {:<26} {:<9} {:<6} {:<6} RTF {:>6.1}x  WER {:>5.1}%  CER {:>5.1}%",
         sample,
         mode,
         decoding,
+        ep,
         rtf,
         w * 100.0,
         c * 100.0
@@ -651,7 +793,7 @@ pub fn record_asr(
         "asr_report.csv",
         ASR_CSV_HEADER,
         &format!(
-            "{},{},{sample},{model},{mode},{decoding},{audio_secs:.2},{proc_secs:.3},\
+            "{},{},{sample},{model},{mode},{decoding},{ep},{audio_secs:.2},{proc_secs:.3},\
 {rtf:.2},{:.4},{:.4}",
             run_id(),
             bench_label(),

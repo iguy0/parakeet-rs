@@ -25,6 +25,9 @@
 #   BEAM_SIZE             Beam width          (default: 5)
 #   OUT_DIR               Results dir         (default: scripts/benchmark/results)
 #   CARGO_FLAGS           Extra cargo flags   (default: --release)
+#   CARGO_FEATURES        Cargo features      (default: empty; e.g. webgpu)
+#   PARAKEET_EP           Execution provider  (default: cpu; e.g. webgpu)
+#   PARAKEET_WEBGPU_DEVICE_ID  GPU index for WebGPU EP (optional)
 
 set -uo pipefail
 
@@ -39,6 +42,9 @@ CLIP="${CLIP:-6_speakers.wav}"
 BEAM_SIZE="${BEAM_SIZE:-5}"
 OUT_DIR="${OUT_DIR:-scripts/benchmark/results}"
 CARGO_FLAGS="${CARGO_FLAGS:---release}"
+CARGO_FEATURES="${CARGO_FEATURES:-}"
+PARAKEET_EP="${PARAKEET_EP:-cpu}"
+export PARAKEET_EP
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUT_DIR/$STAMP"
@@ -66,10 +72,17 @@ run_case() {
   local log_file="$RUN_DIR/${key}_${decoding}.log"
   local txt_file="$RUN_DIR/${key}_${decoding}.txt"
 
-  local -a cmd=(cargo run $CARGO_FLAGS --example "$example" -- "$CLIP")
+  local -a cmd=(cargo run $CARGO_FLAGS)
+  if [ -n "$CARGO_FEATURES" ]; then
+    cmd+=(--features "$CARGO_FEATURES")
+  fi
+  cmd+=(--example "$example" -- "$CLIP")
   [ -n "$mode" ] && cmd+=("$mode")
   cmd+=(-- --decoding "$decoding")
   [ "$decoding" = "beam" ] && cmd+=(--beam-size "$BEAM_SIZE")
+  if [ -n "$PARAKEET_EP" ] && [ "$PARAKEET_EP" != "cpu" ]; then
+    cmd+=(--ep "$PARAKEET_EP")
+  fi
 
   log "running $key/$mode/$decoding: ${cmd[*]}"
   if "${cmd[@]}" >"$log_file" 2>&1; then
