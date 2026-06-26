@@ -54,6 +54,7 @@ git push-fork        # push current branch to origin (iguy0)
 | When changing streaming constants (e.g. `CHUNK_SIZE` in `nemotron.rs`), update the matching export script and document latency | Export-time `--right-context` and Rust mel-frame counts must agree |
 | Run `cargo build` and `cargo test` before proposing upstream PRs | CI only runs build + test on Ubuntu (`/.github/workflows/rust.yml`) |
 | Do not commit ONNX weights, model dirs, or `scripts/__pycache__/` | Models are downloaded separately from HuggingFace |
+| Commit `samples/smoke/` only | Small smoke fixture for WebGPU/benchmark tests on any clone; other `samples/` stays local |
 
 **Current local delta (vs `upstream/master`):**
 

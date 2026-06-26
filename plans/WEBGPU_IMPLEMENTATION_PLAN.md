@@ -132,18 +132,92 @@ Packaged apps on Linux may need `RPATH` or install-time dylib placement ([ort ru
 
 ## 3. Reproduction Steps
 
+### 3.0 Fresh machine setup (clone → test)
+
+Tracked in git (no download needed):
+
+- `samples/smoke/test01_20s.wav` + `test01_20s_transcript.txt` — 20 s smoke clip for WER tests
+- `plans/WEBGPU_IMPLEMENTATION_PLAN.md` — this document
+- `scripts/benchmark/run_all.sh`, `manifest.toml` — harness with `CARGO_FEATURES` / `PARAKEET_EP`
+- `tests/model_benchmark.rs`, `tests/common/mod.rs` — `webgpu_cpu_wer_parity_smoke` and `PARAKEET_EP` harness
+
+**Not** in git (download locally into `models/`):
+
+```bash
+git clone https://github.com/iguy0/parakeet-rs.git
+cd parakeet-rs
+
+# P0 WebGPU parity test — Parakeet CTC (~600 MB total)
+mkdir -p models/parakeet-ctc
+# Option A: huggingface-cli
+huggingface-cli download onnx-community/parakeet-ctc-0.6b-ONNX \
+  --include "onnx/model.onnx" "onnx/model.onnx_data" "tokenizer.json" \
+  --local-dir models/parakeet-ctc
+# Flatten if files landed under onnx/:
+mv -n models/parakeet-ctc/onnx/* models/parakeet-ctc/ 2>/dev/null || true
+
+# Optional — Nemotron streaming (opt-in parity; may segfault on ort rc.12 Linux/Vulkan)
+mkdir -p models/nemotron-speech-streaming-en-0.6b_int8_onnx
+huggingface-cli download lokkju/nemotron-speech-streaming-en-0.6b-int8 \
+  --local-dir models/nemotron-speech-streaming-en-0.6b_int8_onnx
+```
+
+**Linux Vulkan prerequisites:** `vulkan-tools`, GPU driver with Vulkan ICD (`vulkaninfo --summary`).
+
+**Windows 11:** Rust + DX12 GPU; same clone; WebGPU uses D3D12 (see Phase 6).
+
+**Run P0 WebGPU parity (CTC only, safe):**
+
+```bash
+cargo test --release --test model_benchmark --features webgpu \
+  webgpu_cpu_wer_parity_smoke -- --nocapture
+```
+
+**Run with WebGPU EP explicitly:**
+
+```bash
+PARAKEET_EP=webgpu cargo test --release --test model_benchmark --features webgpu \
+  webgpu_cpu_wer_parity_smoke -- --nocapture
+```
+
+**Nemotron WebGPU parity (opt-in — known ORT crash on Linux rc.12):**
+
+```bash
+PARAKEET_WEBGPU_NEMOTRON_PARITY=1 PARAKEET_EP=webgpu \
+  cargo test --release --test model_benchmark --features webgpu \
+  webgpu_cpu_wer_parity_smoke -- --nocapture
+```
+
+**Manual examples:**
+
+```bash
+cargo run --release --features webgpu --example raw \
+  samples/smoke/test01_20s.wav -- --ep webgpu
+
+cargo run --release --features webgpu --example streaming \
+  samples/smoke/test01_20s.wav -- --ep webgpu
+```
+
+**Benchmark harness:**
+
+```bash
+CARGO_FEATURES=webgpu PARAKEET_EP=webgpu ./scripts/benchmark/run_all.sh
+```
+
+---
+
 ### 3.1 Environment
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cd /home/v2/projects/onnx/parakeet-rs
+cd parakeet-rs   # repo root after clone
 cargo build --features webgpu --release
 ```
 
 Prerequisites:
 
-- Models at `models/nemotron-speech-streaming-en-0.6b_int8_onnx/` (or `PARAKEET_NEMOTRON_DIR`)
-- Linux Vulkan: `vulkan-tools`, NVIDIA driver with `nvidia_icd.json`
+- CTC weights at `models/parakeet-ctc/` (P0 parity) and/or Nemotron at `models/nemotron-speech-streaming-en-0.6b_int8_onnx/` (or `PARAKEET_NEMOTRON_DIR`)
+- Linux Vulkan: `vulkan-tools`, NVIDIA/AMD/Intel driver with Vulkan ICD
 - Verify GPU: `vulkaninfo --summary`
 
 ### 3.2 Minimal repro (used during audit)
@@ -223,6 +297,7 @@ Vulkan stack is healthy; failure is at ORT WebGPU / graph level.
 - [x] NVIDIA driver + Vulkan ICD
 - [x] `vulkan-tools` (`vulkaninfo --summary`)
 - [ ] Document `PARAKEET_WEBGPU_DEVICE_ID` convention (Phase 1)
+- [x] `samples/smoke/` fixture committed (20 s WAV + transcript for cross-machine tests)
 - [ ] Optional: install CTC model for low-risk WebGPU smoke (`models/parakeet-ctc`)
 
 **Verify:**

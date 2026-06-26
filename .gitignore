@@ -30,8 +30,10 @@ nemotron-speech-streaming-en-0.6b/
 ultra_diar_streaming_sortformer_8spk_v1/
 ultra_diar_streaming_sortformer_8spk_v1_onnx/
 
-# Local benchmark audio, transcripts, and CSV reports
-samples/
+# Local benchmark audio, transcripts, and CSV reports (except smoke fixture below)
+samples/*
+!samples/smoke/
+!samples/smoke/**
 
 # Nested parakeet-rs fork (separate git repo)
 parakeet-rs/
