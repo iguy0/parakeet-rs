@@ -110,33 +110,60 @@ fn parse_execution_config(flag_args: &[String]) -> Option<ExecutionConfig> {
     }
 }
 
+/// Resolve Nemotron weights directory: `PARAKEET_NEMOTRON_DIR`, then repo
+/// `models/nemotron-speech-streaming-en-0.6b_int8_onnx`, then `./nemotron` /
+/// `./nemotron_multi` (multilingual when a language hint is set).
+fn resolve_nemotron_dir(target_lang: Option<&str>) -> std::path::PathBuf {
+    if target_lang.is_some() {
+        return "./nemotron_multi".into();
+    }
+    if let Ok(dir) = std::env::var("PARAKEET_NEMOTRON_DIR") {
+        if !dir.is_empty() {
+            let p = std::path::PathBuf::from(dir);
+            if p.is_dir() {
+                return p;
+            }
+        }
+    }
+    let default_int8 = std::env::current_dir()
+        .unwrap_or_default()
+        .join("models/nemotron-speech-streaming-en-0.6b_int8_onnx");
+    if default_int8.is_dir() {
+        return default_int8;
+    }
+    if std::path::Path::new("./nemotron").is_dir() {
+        return "./nemotron".into();
+    }
+    "./nemotron_multi".into()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     let args: Vec<String> = env::args().collect();
 
-    let audio_path = if args.len() > 1 {
-        &args[1]
-    } else {
-        "6_speakers.wav"
+    let flag_sep = args.iter().position(|a| a == "--");
+    let positional: &[String] = match flag_sep {
+        Some(i) if i > 1 => &args[1..i],
+        _ => &args[1..],
     };
 
-    let use_eou = args.len() > 2 && args[2] == "eou";
-    // 3rd arg (if not "eou") is treated as target language for the multilingual Nemotron.
-    // Ignored for English-only model.
-    let target_lang: Option<&str> = if args.len() > 2 && args[2] != "eou" {
-        Some(args[2].as_str())
-    } else if args.len() > 3 {
-        Some(args[3].as_str())
-    } else {
+    let audio_path = positional
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or("6_speakers.wav");
+
+    let use_eou = positional.get(1).is_some_and(|s| s == "eou");
+    // Second positional arg (if not `eou`) is a multilingual language hint.
+    let target_lang: Option<&str> = if use_eou {
         None
+    } else {
+        positional.get(1).map(|s| s.as_str())
     };
 
-    let flag_args: Vec<String> = args
-        .iter()
-        .skip_while(|a| *a != "--")
-        .skip(1)
-        .cloned()
-        .collect();
+    let flag_args: Vec<String> = match flag_sep {
+        Some(i) => args[i + 1..].to_vec(),
+        None => Vec::new(),
+    };
     let exec_config = parse_execution_config(&flag_args);
 
     // Load audio
@@ -210,19 +237,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // I use the lang hint as a signal here. If you bothered to pass one
-    // you obviously want the multilingual model, so I jump straight to
-    // ./nemotron_multi. With no hint, I default to the English specialist
-    // (more verbatim on English audio) and only fall back to the multilingual
-    // dir if that's the only one sitting on disk.
-    let model_dir = if target_lang.is_some() {
-        "./nemotron_multi"
-    } else if std::path::Path::new("./nemotron").is_dir() {
-        "./nemotron"
-    } else {
-        "./nemotron_multi"
-    };
-    let mut model = Nemotron::from_pretrained(model_dir, exec_config)?;
+    // English specialist by default; multilingual when a lang hint is passed.
+    let model_dir = resolve_nemotron_dir(target_lang);
+    eprintln!("[model dir: {}]", model_dir.display());
+    let mut model = Nemotron::from_pretrained(&model_dir, exec_config)?;
     let chunk_size = 8960; // 560ms
 
     match model.mode() {

@@ -28,6 +28,8 @@
 #   CARGO_FEATURES        Cargo features      (default: empty; e.g. webgpu)
 #   PARAKEET_EP           Execution provider  (default: cpu; e.g. webgpu)
 #   PARAKEET_WEBGPU_DEVICE_ID  GPU index for WebGPU EP (optional)
+#   PARAKEET_NEMOTRON_DIR Nemotron streaming dir (default: models/nemotron-speech-streaming-en-0.6b_int8_onnx)
+#                         Canonical WebGPU test model when PARAKEET_EP=webgpu (see plans/WEBGPU_IMPLEMENTATION_PLAN.md)
 
 set -uo pipefail
 
@@ -45,6 +47,7 @@ CARGO_FLAGS="${CARGO_FLAGS:---release}"
 CARGO_FEATURES="${CARGO_FEATURES:-}"
 PARAKEET_EP="${PARAKEET_EP:-cpu}"
 export PARAKEET_EP
+NEMOTRON_DIR="${PARAKEET_NEMOTRON_DIR:-$MODELS_ROOT/models/nemotron-speech-streaming-en-0.6b_int8_onnx}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUT_DIR/$STAMP"
@@ -140,6 +143,14 @@ if has_model "$TDT_DIR" encoder-model.onnx decoder_joint-model.onnx vocab.txt; t
   diff_case tdt
 else
   log "skip TDT: model not found in '$TDT_DIR'"
+fi
+
+# --- Nemotron streaming (canonical WebGPU test model when PARAKEET_EP=webgpu) ---
+if has_model "$NEMOTRON_DIR" encoder.onnx decoder_joint.onnx tokenizer.model; then
+  run_case nemotron_streaming streaming "" greedy
+  # streaming example has no --decoding beam flag yet
+else
+  log "skip Nemotron: model not found in '$NEMOTRON_DIR' (set PARAKEET_NEMOTRON_DIR)"
 fi
 
 # --- Unified (offline + streaming) ---

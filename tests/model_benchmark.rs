@@ -33,21 +33,30 @@ fn smoke_max_wer() -> f32 {
 }
 
 /// Stream a full clip through Nemotron and return the final transcript.
-fn nemotron_transcribe(model: &mut parakeet_rs::Nemotron, audio: &[f32]) -> String {
+fn nemotron_transcribe_result(
+    model: &mut parakeet_rs::Nemotron,
+    audio: &[f32],
+) -> Result<String, String> {
     for chunk in audio.chunks(NEMOTRON_CHUNK_SAMPLES) {
         let mut buf = chunk.to_vec();
         if buf.len() < NEMOTRON_CHUNK_SAMPLES {
             buf.resize(NEMOTRON_CHUNK_SAMPLES, 0.0);
         }
-        model.transcribe_chunk(&buf).expect("nemotron chunk");
+        model
+            .transcribe_chunk(&buf)
+            .map_err(|e| e.to_string())?;
     }
     // Flush with trailing silence so the last tokens are emitted.
     for _ in 0..3 {
         model
             .transcribe_chunk(&vec![0.0; NEMOTRON_CHUNK_SAMPLES])
-            .expect("nemotron flush");
+            .map_err(|e| e.to_string())?;
     }
-    model.get_transcript()
+    Ok(model.get_transcript())
+}
+
+fn nemotron_transcribe(model: &mut parakeet_rs::Nemotron, audio: &[f32]) -> String {
+    nemotron_transcribe_result(model, audio).expect("nemotron transcribe")
 }
 
 /// Read and clean a sample's reference transcript (speaker headers stripped).
@@ -775,9 +784,9 @@ section 4 (known ORT WebGPU issues on some graphs, e.g. Nemotron Slice on ort rc
     }
 }
 
-/// CPU vs WebGPU WER parity on the smoke clip. CTC offline is the primary P0
-/// target; Nemotron streaming is optional (may segfault on ort rc.12 — opt in
-/// with `PARAKEET_WEBGPU_NEMOTRON_PARITY=1`).
+/// CPU vs WebGPU WER parity on the smoke clip using Nemotron streaming only
+/// (`nemotron-speech-streaming-en-0.6b` int8). Skips when weights are missing
+/// or WebGPU transcribe fails (known ort rc.12 Linux/Vulkan Slice issue).
 #[cfg(feature = "webgpu")]
 #[test]
 fn webgpu_cpu_wer_parity_smoke() {
@@ -786,62 +795,23 @@ fn webgpu_cpu_wer_parity_smoke() {
         return;
     };
 
-    let (audio, _) = load_wav_mono_16k(&sample.wav);
-    let audio_secs = audio.len() as f32 / 16_000.0;
-    let reference = reference_for(&sample);
-
-    if ctc_available() {
-        eprintln!("\n[webgpu_cpu_wer_parity_smoke] CTC offline (P0):");
-        let audio = audio.clone();
-        let reference = reference.clone();
-        assert_cpu_webgpu_wer_parity(
-            "webgpu_cpu_wer_parity_smoke/ctc",
-            "parakeet-ctc",
-            "offline",
-            "greedy",
-            &reference,
-            audio_secs,
-            |cfg| {
-                use parakeet_rs::Parakeet;
-                let mut m = Parakeet::from_pretrained_with_decoding(
-                    ctc_dir(),
-                    Some(cfg.clone()),
-                    DecodingStrategy::Greedy,
-                )
-                .map_err(|e| e.to_string())?;
-                Ok(offline_transcribe(&mut m, &audio))
-            },
-        );
-    } else {
-        skip(
-            "webgpu_cpu_wer_parity_smoke/ctc",
-            &format!("CTC model not found at {}", ctc_dir().display()),
-        );
-    }
-
-    let nemotron_parity = std::env::var("PARAKEET_WEBGPU_NEMOTRON_PARITY")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
-    if !nemotron_parity {
-        skip(
-            "webgpu_cpu_wer_parity_smoke/nemotron",
-            "set PARAKEET_WEBGPU_NEMOTRON_PARITY=1 to run (may segfault on ort rc.12 Linux/Vulkan)",
-        );
-        return;
-    }
     if !nemotron_available() {
         skip(
-            "webgpu_cpu_wer_parity_smoke/nemotron",
+            "webgpu_cpu_wer_parity_smoke",
             &format!("model not found at {}", nemotron_dir().display()),
         );
         return;
     }
 
-    eprintln!("\n[webgpu_cpu_wer_parity_smoke] Nemotron streaming (P0, opt-in):");
+    let (audio, _) = load_wav_mono_16k(&sample.wav);
+    let audio_secs = audio.len() as f32 / 16_000.0;
+    let reference = reference_for(&sample);
     let mut buf = audio;
     peak_normalize(&mut buf);
+
+    eprintln!("\n[webgpu_cpu_wer_parity_smoke] Nemotron streaming (CPU vs WebGPU WER):");
     assert_cpu_webgpu_wer_parity(
-        "webgpu_cpu_wer_parity_smoke/nemotron",
+        "webgpu_cpu_wer_parity_smoke",
         "nemotron-en-0.6b-int8",
         "streaming",
         "greedy",
@@ -851,7 +821,7 @@ fn webgpu_cpu_wer_parity_smoke() {
             let mut m = parakeet_rs::Nemotron::from_pretrained(nemotron_dir(), Some(cfg.clone()))
                 .map_err(|e| e.to_string())?;
             let t0 = Instant::now();
-            let hyp = nemotron_transcribe(&mut m, &buf);
+            let hyp = nemotron_transcribe_result(&mut m, &buf)?;
             Ok((hyp, t0.elapsed().as_secs_f32()))
         },
     );

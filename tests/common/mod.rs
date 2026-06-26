@@ -109,10 +109,10 @@ pub fn tdt_available() -> bool {
     )
 }
 pub fn unified_available() -> bool {
-    dir_has(
-        &unified_dir(),
-        &["encoder.onnx", "decoder_joint.onnx", "tokenizer.model"],
-    )
+    let d = unified_dir();
+    d.join("tokenizer.model").exists()
+        && (d.join("encoder.onnx").exists() || d.join("encoder.int8.onnx").exists())
+        && (d.join("decoder_joint.onnx").exists() || d.join("decoder_joint.int8.onnx").exists())
 }
 pub fn eou_available() -> bool {
     dir_has(&eou_dir(), &["encoder.onnx", "decoder_joint.onnx", "tokenizer.json"])
