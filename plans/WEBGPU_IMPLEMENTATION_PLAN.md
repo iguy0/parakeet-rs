@@ -8,15 +8,31 @@
 | **Phase 1** — EP harness (`PARAKEET_EP`) | **Done** | `execution_config()`, `ep_skip_if_unavailable()`, `PARAKEET_WEBGPU_DEVICE_ID` in `tests/common/mod.rs`; wired into `model_benchmark.rs` |
 | **Phase 2** — WebGPU session + config | **Done** | `parallel_execution(false)` + `memory_pattern(false)` for WebGPU/DirectML before EP registration; `with_webgpu_device_id()` on `ExecutionConfig` |
 | **Phase 3** — Example / benchmark CLI | **Done** | `--ep webgpu` on `streaming.rs` + `raw.rs`; `CARGO_FEATURES` + `PARAKEET_EP` in `run_all.sh` |
-| **Phase 4** — CPU vs WebGPU correctness matrix | **Done** | CSV `ep` column; `record_asr(ep)`; `webgpu_cpu_wer_parity_smoke` (CTC P0; Nemotron opt-in via `PARAKEET_WEBGPU_NEMOTRON_PARITY`) |
+| **Phase 4** — CPU vs WebGPU correctness matrix | **Partial** | CSV `ep` column done; `webgpu_cpu_wer_parity_smoke` still uses CTC P0 — **refactor to Nemotron-only** (see §3.0, §5 Phase 4) |
 | **Phase 5** — CI compile gate | **Done** | Ubuntu `webgpu-build` + `cargo test --lib`; optional `webgpu-build-windows` compile job in `rust.yml` |
 | **Phase 6** — Windows 11 validation | **Not started** | Manual or self-hosted runner; D3D12 path |
 | **Phase 7** — Upstream ORT tracking | **Ongoing** | Nemotron fails on ort `2.0.0-rc.12`; monitor rc.13+ for WebGPU fixes |
 
-**Last updated:** 2026-06-26 (Phase 5 implemented)  
-**Current phase:** Phase 6 — Windows 11 validation (manual D3D12 path; do not claim Windows-ready without this)  
-**Status:** CI compiles `--features webgpu` on Ubuntu + Windows; WER parity smoke for CTC; Nemotron WebGPU still blocked on ort rc.12 (Linux/Vulkan)  
+**Last updated:** 2026-06-26 (Phase 5 done; WebGPU test model policy → Nemotron)  
+**Current phase:** Phase 4 follow-up — refactor WebGPU tests to Nemotron-only; then Phase 6 (Windows 11 D3D12 validation)  
+**Status:** CI compiles `--features webgpu` on Ubuntu + Windows; parity harness exists but targets CTC — **all WebGPU tests must use `nemotron-speech-streaming-en-0.6b`** (int8 ONNX at `models/nemotron-speech-streaming-en-0.6b_int8_onnx/`); Nemotron WebGPU still blocked on ort rc.12 (Linux/Vulkan Slice validation)  
 **Primary objective:** Develop and validate WebGPU on Linux, with a path to certify behavior for Windows 11 users, without changing CPU defaults or breaking upstream mergeability.
+
+### WebGPU test model policy
+
+**All WebGPU correctness and smoke tests use one canonical model:**
+
+| Field | Value |
+|-------|-------|
+| Model | **Nemotron Speech Streaming EN 0.6B** (`nemotron-speech-streaming-en-0.6b`) |
+| Local weights dir | `models/nemotron-speech-streaming-en-0.6b_int8_onnx/` (override: `PARAKEET_NEMOTRON_DIR`) |
+| HF source | `lokkju/nemotron-speech-streaming-en-0.6b-int8` |
+| API | `parakeet_rs::Nemotron` — streaming, 560 ms chunks |
+| Smoke clip | `samples/smoke/test01_20s.wav` |
+
+Do **not** use Parakeet CTC, TDT, or other families for WebGPU parity unless explicitly expanding the matrix after Nemotron passes. Examples (`streaming.rs`), benchmark harness (`run_all.sh`), and `webgpu_cpu_wer_parity_smoke` should all target Nemotron when `PARAKEET_EP=webgpu` or `--ep webgpu`.
+
+**Known blocker (Linux/Vulkan, ort rc.12):** WebGPU inference on Nemotron may fail on first `transcribe_chunk` (Slice validation) or segfault. Tests must skip gracefully on EP failure until ort fixes land; do not mask failures by falling back to a different model.
 
 ---
 
@@ -89,7 +105,7 @@ WebGPU affects **only ONNX session creation**. Audio prep, decoders, streaming c
 
 | Model | ONNX graphs | Risk | Rationale |
 |-------|-------------|------|-----------|
-| Parakeet CTC | 1 static-ish graph | **Low** | Simplest; best first correctness target |
+| Parakeet CTC | 1 static-ish graph | **Low** | Good CPU baseline; **not used for WebGPU tests** (Nemotron is canonical) |
 | Parakeet TDT | encoder + decoder_joint | **Medium** | RNNT loop; duration head |
 | ParakeetUnified | encoder + decoder_joint | **Medium** | Same RNNT pattern as Nemotron |
 | Nemotron | encoder (~653 MB) + decoder_joint | **High** | **Failed on WebGPU** (Slice validation) |
@@ -98,7 +114,7 @@ WebGPU affects **only ONNX session creation**. Audio prep, decoders, streaming c
 | Sortformer | single diar graph | **High** | Custom STFT path; dynamic chunk metadata |
 | Multitalker | encoder + decoder + Sortformer | **High** | Combines streaming ASR + diarization |
 
-**Scope decision:** Prioritize harness + CTC/Nemotron smoke first; expand matrix only after upstream ORT fixes or per-model `forceCpuNodeNames` workarounds.
+**Scope decision:** All WebGPU harness and parity tests use **Nemotron streaming EN 0.6B** only. Expand to other families (CTC, Unified, TDT, Sortformer) only after Nemotron WebGPU passes on the target platform or upstream documents a fix. Other models remain in the risk table for future matrix work.
 
 ### 2.4 Platform mapping (implicit dependency)
 
@@ -147,26 +163,18 @@ Tracked in git (no download needed):
 git clone https://github.com/iguy0/parakeet-rs.git
 cd parakeet-rs
 
-# P0 WebGPU parity test — Parakeet CTC (~600 MB total)
-mkdir -p models/parakeet-ctc
-# Option A: huggingface-cli
-huggingface-cli download onnx-community/parakeet-ctc-0.6b-ONNX \
-  --include "onnx/model.onnx" "onnx/model.onnx_data" "tokenizer.json" \
-  --local-dir models/parakeet-ctc
-# Flatten if files landed under onnx/:
-mv -n models/parakeet-ctc/onnx/* models/parakeet-ctc/ 2>/dev/null || true
-
-# Optional — Nemotron streaming (opt-in parity; may segfault on ort rc.12 Linux/Vulkan)
+# Required for all WebGPU tests — Nemotron streaming EN 0.6B int8 (~700 MB)
 mkdir -p models/nemotron-speech-streaming-en-0.6b_int8_onnx
 huggingface-cli download lokkju/nemotron-speech-streaming-en-0.6b-int8 \
   --local-dir models/nemotron-speech-streaming-en-0.6b_int8_onnx
+# Expect: encoder.onnx, encoder.onnx.data, decoder_joint.onnx, tokenizer.model
 ```
 
 **Linux Vulkan prerequisites:** `vulkan-tools`, GPU driver with Vulkan ICD (`vulkaninfo --summary`).
 
-**Windows 11:** Rust + DX12 GPU; same clone; WebGPU uses D3D12 (see Phase 6).
+**Windows 11:** Rust + DX12 GPU; same clone + same Nemotron weights; WebGPU uses D3D12 (see Phase 6).
 
-**Run P0 WebGPU parity (CTC only, safe):**
+**Run WebGPU parity smoke (Nemotron streaming, CPU vs WebGPU WER):**
 
 ```bash
 cargo test --release --test model_benchmark --features webgpu \
@@ -180,13 +188,7 @@ PARAKEET_EP=webgpu cargo test --release --test model_benchmark --features webgpu
   webgpu_cpu_wer_parity_smoke -- --nocapture
 ```
 
-**Nemotron WebGPU parity (opt-in — known ORT crash on Linux rc.12):**
-
-```bash
-PARAKEET_WEBGPU_NEMOTRON_PARITY=1 PARAKEET_EP=webgpu \
-  cargo test --release --test model_benchmark --features webgpu \
-  webgpu_cpu_wer_parity_smoke -- --nocapture
-```
+> **Code drift:** As of Phase 5, `webgpu_cpu_wer_parity_smoke` still targets CTC with Nemotron behind `PARAKEET_WEBGPU_NEMOTRON_PARITY=1`. Next session should refactor to Nemotron-only per policy above and remove the CTC / opt-in env gate.
 
 **Manual examples:**
 
@@ -216,7 +218,7 @@ cargo build --features webgpu --release
 
 Prerequisites:
 
-- CTC weights at `models/parakeet-ctc/` (P0 parity) and/or Nemotron at `models/nemotron-speech-streaming-en-0.6b_int8_onnx/` (or `PARAKEET_NEMOTRON_DIR`)
+- Nemotron int8 weights at `models/nemotron-speech-streaming-en-0.6b_int8_onnx/` (or `PARAKEET_NEMOTRON_DIR`) — **required for all WebGPU tests**
 - Linux Vulkan: `vulkan-tools`, NVIDIA/AMD/Intel driver with Vulkan ICD
 - Verify GPU: `vulkaninfo --summary`
 
@@ -298,7 +300,7 @@ Vulkan stack is healthy; failure is at ORT WebGPU / graph level.
 - [x] `vulkan-tools` (`vulkaninfo --summary`)
 - [ ] Document `PARAKEET_WEBGPU_DEVICE_ID` convention (Phase 1)
 - [x] `samples/smoke/` fixture committed (20 s WAV + transcript for cross-machine tests)
-- [ ] Optional: install CTC model for low-risk WebGPU smoke (`models/parakeet-ctc`)
+- [ ] Optional: install CTC model for general (non-WebGPU) benchmark matrix (`models/parakeet-ctc`)
 
 **Verify:**
 
@@ -489,22 +491,25 @@ Update `record_asr(...)` to accept `ep: &str`.
 
 **File:** `tests/model_benchmark.rs`
 
-Add test `webgpu_cpu_wer_parity_smoke`:
+Add test `webgpu_cpu_wer_parity_smoke` (**Nemotron streaming only**):
 
-1. Transcribe smoke clip with CPU → `wer_cpu`
-2. Transcribe smoke clip with WebGPU → `wer_gpu` (or capture error)
-3. If WebGPU succeeds: assert `|wer_gpu - wer_cpu| <= PARAKEET_WEBGPU_MAX_WER_DELTA` (default e.g. 0.05)
-4. If WebGPU fails: print skip + link to this plan §4 (known upstream issue)
+1. Skip if `nemotron_available()` is false
+2. Transcribe smoke clip with CPU → `wer_cpu` (`Nemotron::from_pretrained`, streaming chunks)
+3. Transcribe smoke clip with WebGPU → `wer_gpu` (or capture error)
+4. If WebGPU succeeds: assert `|wer_gpu - wer_cpu| <= PARAKEET_WEBGPU_MAX_WER_DELTA` (default e.g. 0.05)
+5. If WebGPU fails: print skip + link to this plan §4 (known upstream issue on ort rc.12 Linux/Vulkan)
 
-Run matrix (document in plan, execute manually):
+**Remove** CTC branch and `PARAKEET_WEBGPU_NEMOTRON_PARITY` opt-in once refactored.
 
-| Model | Mode | Priority |
-|-------|------|----------|
-| CTC | offline | P0 |
-| Nemotron | streaming | P0 (currently fails) |
-| Unified | offline + streaming | P1 |
-| TDT | offline | P1 |
-| Sortformer | diarization | P2 |
+Run matrix (document in plan; **WebGPU P0 = Nemotron only**):
+
+| Model | Mode | WebGPU priority |
+|-------|------|-----------------|
+| **Nemotron EN 0.6B** | streaming | **P0** (canonical; currently fails Linux/Vulkan rc.12) |
+| CTC | offline | P2 (CPU benchmark only unless matrix expanded) |
+| Unified | offline + streaming | P2 |
+| TDT | offline | P2 |
+| Sortformer | diarization | P3 |
 
 ---
 
@@ -608,8 +613,8 @@ Update AGENTS.md "Current local delta" table with WebGPU harness row when Phase 
 WebGPU remains **opt-in experimental** until all of:
 
 - [ ] Phase 1–3 complete (harness + CLI)
-- [ ] Phase 4: CTC smoke passes WER parity CPU vs WebGPU on Linux
-- [ ] Phase 4: Nemotron smoke passes OR documented upstream blocker with skip logic
+- [ ] Phase 4: Nemotron smoke passes WER parity CPU vs WebGPU on Linux **or** documented upstream blocker with skip logic (current: blocked on ort rc.12)
+- [ ] Phase 4 follow-up: refactor `webgpu_cpu_wer_parity_smoke` to Nemotron-only (remove CTC / `PARAKEET_WEBGPU_NEMOTRON_PARITY`)
 - [ ] Phase 6: Windows 11 smoke passes (transcript + WER threshold)
 - [ ] Phase 5: CI compile gate green
 - [ ] No change to default EP (CPU)
@@ -641,9 +646,10 @@ cargo build --release --features webgpu
 # Benchmark suite (CPU default)
 cargo test --release --test model_benchmark --features "sortformer multitalker cohere" -- --nocapture
 
-# WebGPU Nemotron smoke
+# WebGPU Nemotron parity smoke (canonical WebGPU test model)
 PARAKEET_EP=webgpu PARAKEET_WEBGPU_DEVICE_ID=0 \
-  cargo test --release --test model_benchmark --features webgpu -- --nocapture
+  cargo test --release --test model_benchmark --features webgpu \
+  webgpu_cpu_wer_parity_smoke -- --nocapture
 
 # Manual streaming demo
 cargo run --release --features webgpu --example streaming -- \
