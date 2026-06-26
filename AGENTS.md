@@ -2,8 +2,9 @@
 
 Primary reference for AI agents and developers working in this directory.
 
-**Upstream:** [altunenes/parakeet-rs](https://github.com/altunenes/parakeet-rs)  
-**This copy:** Local fork under `/home/v2/projects/onnx/parakeet-rs` for experiments and testing. Changes here should stay mergeable with upstream.
+**Upstream (consume):** [altunenes/parakeet-rs](https://github.com/altunenes/parakeet-rs) — `upstream` remote, fetch/merge only  
+**Fork (publish):** [iguy0/parakeet-rs](https://github.com/iguy0/parakeet-rs) — `origin` remote, all pushes go here  
+**This copy:** Local checkout under `/home/v2/projects/onnx/parakeet-rs`. Changes should stay mergeable with upstream.
 
 ---
 
@@ -30,6 +31,20 @@ When a local experiment proves stable, propose it upstream as a small, focused P
 
 ## Fork & Upstream Sync Policy
 
+### Git remotes
+
+| Remote | URL | Use |
+|--------|-----|-----|
+| `origin` | `iguy0/parakeet-rs` | **Push all branches and tags.** Default push target. |
+| `upstream` | `altunenes/parakeet-rs` | **Fetch and merge only** (`pushurl` disabled). Never push here. |
+
+```bash
+git sync-upstream    # fetch upstream + merge upstream/master into current branch
+git push-fork        # push current branch to origin (iguy0)
+```
+
+**Daily workflow:** develop on `master` (or feature branches) → `git sync-upstream` periodically → `git push origin <branch>`.
+
 | Rule | Rationale |
 |------|-----------|
 | **Extend with minimal diffs** — smallest change that achieves the goal | Keeps review burden low and merge conflicts rare |
@@ -40,7 +55,7 @@ When a local experiment proves stable, propose it upstream as a small, focused P
 | Run `cargo build` and `cargo test` before proposing upstream PRs | CI only runs build + test on Ubuntu (`/.github/workflows/rust.yml`) |
 | Do not commit ONNX weights, model dirs, or `scripts/__pycache__/` | Models are downloaded separately from HuggingFace |
 
-**Current local delta (vs `origin/master`):**
+**Current local delta (vs `upstream/master`):**
 
 | Path | Status | Notes |
 |------|--------|-------|
