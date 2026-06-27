@@ -34,6 +34,10 @@ name = "streaming-diarization"
 path = "examples/streaming_diarization.rs"
 
 [[example]]
+name = "diarization-8spk"
+path = "examples/diarization_8spk.rs"
+
+[[example]]
 name = "shared_model"
 path = "examples/shared_model.rs"
 

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 pub const NEMOTRON_DIR_ENV: &str = "PARAKEET_NEMOTRON_DIR";
 pub const MULTITALKER_DIR_ENV: &str = "PARAKEET_MULTITALKER_DIR";
 pub const SORTFORMER_ONNX_ENV: &str = "PARAKEET_SORTFORMER_ONNX";
+pub const SORTFORMER_8SPK_ONNX_ENV: &str = "PARAKEET_SORTFORMER_8SPK_ONNX";
 pub const EP_ENV: &str = "PARAKEET_EP";
 pub const WEBGPU_DEVICE_ID_ENV: &str = "PARAKEET_WEBGPU_DEVICE_ID";
 
@@ -49,6 +50,13 @@ pub fn sortformer_onnx() -> PathBuf {
     )
 }
 
+pub fn sortformer_8spk_onnx() -> PathBuf {
+    resolve(
+        SORTFORMER_8SPK_ONNX_ENV,
+        "models/ultra_diar_streaming_sortformer_8spk_v1_onnx/ultra_diar_streaming_sortformer_8spk_v1.onnx",
+    )
+}
+
 /// True if every named file exists inside `dir`.
 pub fn dir_has(dir: &Path, files: &[&str]) -> bool {
     dir.is_dir() && files.iter().all(|f| dir.join(f).exists())
@@ -70,6 +78,10 @@ pub fn multitalker_available() -> bool {
 
 pub fn sortformer_available() -> bool {
     sortformer_onnx().exists()
+}
+
+pub fn sortformer_8spk_available() -> bool {
+    sortformer_8spk_onnx().exists()
 }
 
 // Additional ASR model dirs (env-overridable; default under models/). None are

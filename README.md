@@ -117,7 +117,7 @@ for chunk in audio.chunks(17920) {  // ~1.12s at 16kHz
 ```
 See `examples/multitalker.rs` for full usage with latency modes.
 
-**Sortformer v2 & v2.1 (Speaker Diarization)**: Streaming diarization (4 speakers by default; 8-speaker Ultra exports supported via ONNX `num_speakers` metadata)
+**Sortformer v2 & v2.1 (Speaker Diarization)**: Streaming diarization up to 4 speakers (NVIDIA v2/v2.1)
 ```toml
 parakeet-rs = { version = "0.3", features = ["sortformer"] }
 ```
@@ -127,7 +127,7 @@ use parakeet_rs::sortformer::{Sortformer, DiarizationConfig};
 let mut sortformer = Sortformer::with_config(
     "diar_streaming_sortformer_4spk-v2.onnx", // or v2.1.onnx
     None,
-    DiarizationConfig::callhome(),  // or dihard3(),custom()
+    DiarizationConfig::callhome(),  // or dihard3(), custom()
 )?;
 let segments = sortformer.diarize(audio, 16000, 1)?;
 for seg in segments {
@@ -135,17 +135,31 @@ for seg in segments {
         seg.start as f64 / 16_000.0, seg.end as f64 / 16_000.0);
 }
 
-// 8-speaker Ultra Sortformer: pass ONNX with num_speakers=8 metadata
-// println!("{}", sortformer.num_speakers()); // 8
-
 // For streaming/real-time use, diarize_chunk() preserves state across calls:
 let segments = sortformer.diarize_chunk(&audio_chunk_16k_mono)?;
 ```
 See `examples/diarization.rs` for combining with TDT transcription.
+See `examples/streaming_diarization.rs` for streaming chunk feeding.
 
-See `examples/streaming_diarization.rs` for `diarize_chunk` usage example.
+**Ultra Sortformer 8spk (Speaker Diarization)**: Streaming diarization up to **8 speakers** via [Ultra-Sortformer](https://github.com/LilDevsy0117/Ultra-Sortformer). Speaker count and streaming chunk sizes are read from ONNX metadata (`num_speakers=8`, `chunk_len=340`, `right_context=40`, etc.).
+```toml
+parakeet-rs = { version = "0.3", features = ["sortformer"] }
+```
+```rust
+use parakeet_rs::sortformer::{Sortformer, DiarizationConfig};
 
-See `scripts/export_diar_sortformer.py` for exporting the model with custom streaming parameters.
+let mut sortformer = Sortformer::with_config(
+    "ultra_diar_streaming_sortformer_8spk_v1.onnx",
+    None,
+    DiarizationConfig::ultra_8spk(),  // tuned for 8-way sigmoid heads
+)?;
+assert_eq!(sortformer.num_speakers(), 8);
+let segments = sortformer.diarize(audio, 16000, 1)?;
+```
+Download: [investguy/ultra_diar_streaming_sortformer_8spk_v1_onnx](https://huggingface.co/investguy/ultra_diar_streaming_sortformer_8spk_v1_onnx) (~492 MB fp32). Re-export from NeMo: `scripts/export_ultra_diar_8spk.py`.
+
+See `examples/diarization_8spk.rs` for a runnable 8-speaker demo.
+See `scripts/export_diar_sortformer.py` for exporting the 4spk model with custom streaming parameters.
 
 ## Setup
 
@@ -165,7 +179,9 @@ See `scripts/export_diar_sortformer.py` for exporting the model with custom stre
 
 **Cohere Transcribe**: Download from [HuggingFace](https://huggingface.co/onnx-community/cohere-transcribe-03-2026-ONNX): `encoder_model.onnx` (+ `.onnx_data*`), `decoder_model_merged.onnx` (+ `.onnx_data`), `tokenizer.json` (FP32, FP16, INT8, INT4 variants available)
 
-**Diarization (Sortformer v2 & v2.1)**: Download from [HuggingFace](https://huggingface.co/altunenes/parakeet-rs/tree/main): `diar_streaming_sortformer_4spk-v2.onnx` or `v2.1.onnx`.
+**Diarization (Sortformer v2 & v2.1, 4 speakers)**: Download from [HuggingFace](https://huggingface.co/altunenes/parakeet-rs/tree/main): `diar_streaming_sortformer_4spk-v2.onnx` or `v2.1.onnx`.
+
+**Diarization (Ultra Sortformer 8spk)**: Download from [HuggingFace](https://huggingface.co/investguy/ultra_diar_streaming_sortformer_8spk_v1_onnx): `ultra_diar_streaming_sortformer_8spk_v1.onnx` (~492 MB). NeMo source for re-export: [devsy0117/ultra_diar_streaming_sortformer_8spk_v1](https://huggingface.co/devsy0117/ultra_diar_streaming_sortformer_8spk_v1).
 
 Quantized versions available (int8). All files must be in the same directory.
 
@@ -197,6 +213,7 @@ let config = ExecutionConfig::new()
 - [Multitalker: Streaming multi-speaker ASR with speaker-kernel injection](https://huggingface.co/nvidia/multitalker-parakeet-streaming-0.6b-v1) ([ONNX int8](https://huggingface.co/smcleod/multitalker-parakeet-streaming-0.6b-v1-onnx-int8))
 - [Cohere Transcribe: Offline multilingual ASR (14 languages, long-form supported)](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) ([ONNX](https://huggingface.co/onnx-community/cohere-transcribe-03-2026-ONNX))
 - [Sortformer v2 & v2.1: Streaming speaker diarization (up to 4 speakers)](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2) NOTE: you can also download v2.1 model same way.
+- [Ultra Sortformer 8spk: Streaming speaker diarization (up to 8 speakers)](https://huggingface.co/investguy/ultra_diar_streaming_sortformer_8spk_v1_onnx) ([NeMo source](https://huggingface.co/devsy0117/ultra_diar_streaming_sortformer_8spk_v1))
 - Token-level timestamps (CTC, TDT)
 
 ## Notes

@@ -9,6 +9,8 @@
 //! Models exercised:
 //!   - Nemotron streaming ASR (default ASR)            — no cargo feature needed
 //!   - Sortformer 4spk v2.1 diarization                — `--features sortformer`
+//!   - Sortformer 8spk Ultra diarization               — `--features sortformer` (+ 8spk weights)
+//!   - 4spk vs 8spk diarization comparison             — `diarization_4spk_vs_8spk_benchmark`
 //!   - Multitalker speaker-attributed streaming ASR    — `--features multitalker`
 //!
 //! Run everything against local models:
@@ -563,6 +565,326 @@ num_ref_speakers,num_hyp_speakers,der,missed,false_alarm,confusion,jer";
         der * 100.0,
         ceiling * 100.0
     );
+}
+
+/// Compare NVIDIA Sortformer 4spk vs Ultra Sortformer 8spk on the same clips:
+/// DER/JER/RTF side-by-side, rows appended to `samples/diarization_4spk_vs_8spk.csv`.
+/// Requires both models (see `PARAKEET_SORTFORMER_ONNX` and `PARAKEET_SORTFORMER_8SPK_ONNX`).
+#[cfg(feature = "sortformer")]
+#[test]
+fn diarization_4spk_vs_8spk_benchmark() {
+    use parakeet_rs::sortformer::{DiarizationConfig, Sortformer};
+    use std::path::Path;
+    use std::time::Instant;
+
+    if !sortformer_available() {
+        skip(
+            "diarization_4spk_vs_8spk_benchmark",
+            &format!("4spk model not found at {}", sortformer_onnx().display()),
+        );
+        return;
+    }
+    if !sortformer_8spk_available() {
+        skip(
+            "diarization_4spk_vs_8spk_benchmark",
+            &format!(
+                "8spk model not found at {} (set {})",
+                sortformer_8spk_onnx().display(),
+                SORTFORMER_8SPK_ONNX_ENV
+            ),
+        );
+        return;
+    }
+
+    if ep_skip_if_unavailable("diarization_4spk_vs_8spk_benchmark") {
+        return;
+    }
+
+    fn diarize_sample(
+        model_path: &Path,
+        config: DiarizationConfig,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> (Vec<DiarSegment>, f32, f32, usize) {
+        let mut sf = Sortformer::with_config(model_path, Some(execution_config()), config)
+            .expect("load sortformer");
+        let speakers = sf.num_speakers();
+        let t0 = Instant::now();
+        let segments = sf.diarize(audio.to_vec(), sample_rate, 1).expect("diarize");
+        let proc_secs = t0.elapsed().as_secs_f32();
+        let audio_secs = audio.len() as f32 / 16_000.0;
+        let rtf = if proc_secs > 0.0 {
+            audio_secs / proc_secs
+        } else {
+            0.0
+        };
+        let hyp: Vec<DiarSegment> = segments
+            .iter()
+            .map(|s| DiarSegment {
+                speaker: s.speaker_id,
+                start: s.start as f32 / 16_000.0,
+                end: s.end as f32 / 16_000.0,
+            })
+            .collect();
+        (hyp, proc_secs, rtf, speakers)
+    }
+
+    let label = bench_label();
+    let rid = run_id();
+    let samples = discover_samples();
+    assert!(
+        samples.iter().any(|s| s.name == "smoke"),
+        "samples/smoke must exist"
+    );
+
+    let header = "run_id,label,sample,audio_secs,ref_speakers,latency_8spk_secs,full_chunks_8spk,\
+der_4spk,jer_4spk,rtf_4spk,proc_secs_4spk,hyp_speakers_4spk,\
+der_8spk,jer_8spk,rtf_8spk,proc_secs_8spk,hyp_speakers_8spk,\
+der_delta,jer_delta,rtf_ratio";
+
+    eprintln!("\nDiarization comparison (4spk vs 8spk):");
+    eprintln!(
+        "{:<28} {:>4} {:>5} {:>6} {:>6} {:>6} | {:>6} {:>6}",
+        "sample", "ref", "sec", "DER4", "DER8", "dDER", "JER4", "JER8"
+    );
+    eprintln!("{}", "-".repeat(80));
+
+    let mut sf8_latency = 30.4f32;
+    if let Ok(probe) = Sortformer::with_config(
+        sortformer_8spk_onnx(),
+        Some(execution_config()),
+        DiarizationConfig::ultra_8spk(),
+    ) {
+        sf8_latency = probe.latency();
+    }
+
+    for sample in &samples {
+        let (audio, sample_rate) = load_wav_mono_16k(&sample.wav);
+        let audio_secs = audio.len() as f32 / 16_000.0;
+
+        let (hyp4, proc4, rtf4, spk4) = diarize_sample(
+            &sortformer_onnx(),
+            DiarizationConfig::callhome(),
+            &audio,
+            sample_rate,
+        );
+        let (hyp8, proc8, rtf8, spk8) = diarize_sample(
+            &sortformer_8spk_onnx(),
+            DiarizationConfig::ultra_8spk(),
+            &audio,
+            sample_rate,
+        );
+
+        let raw_ref = std::fs::read_to_string(&sample.transcript).expect("read transcript");
+        let reference = parse_reference_turns(&raw_ref, audio_secs);
+        let m4 = diarization_metrics(&reference, &hyp4, audio_secs);
+        let m8 = diarization_metrics(&reference, &hyp8, audio_secs);
+        let der_delta = m8.der - m4.der;
+        let jer_delta = m8.jer - m4.jer;
+        let rtf_ratio = if rtf8 > 0.0 { rtf4 / rtf8 } else { 0.0 };
+        let full_chunks_8spk = if sf8_latency > 0.0 {
+            (audio_secs / sf8_latency).floor() as u32
+        } else {
+            0
+        };
+
+        eprintln!(
+            "{:<28} {:>4} {:>5.0} {:>5.1}% {:>5.1}% {:>+5.1}% | {:>5.1}% {:>5.1}%  (8spk chunks={})",
+            sample.name,
+            m4.num_ref_speakers,
+            audio_secs,
+            m4.der * 100.0,
+            m8.der * 100.0,
+            der_delta * 100.0,
+            m4.jer * 100.0,
+            m8.jer * 100.0,
+            full_chunks_8spk
+        );
+
+        append_csv_row(
+            "diarization_4spk_vs_8spk.csv",
+            header,
+            &format!(
+                "{rid},{label},{},{audio_secs:.2},{},{sf8_latency:.2},{full_chunks_8spk},\
+{:.4},{:.4},{:.2},{:.3},{spk4},\
+{:.4},{:.4},{:.2},{:.3},{spk8},\
+{:.4},{:.4},{:.2}",
+                sample.name,
+                m4.num_ref_speakers,
+                m4.der,
+                m4.jer,
+                rtf4,
+                proc4,
+                m8.der,
+                m8.jer,
+                rtf8,
+                proc8,
+                der_delta,
+                jer_delta,
+                rtf_ratio
+            ),
+        );
+    }
+
+    eprintln!(
+        "\nwrote {} rows to samples/diarization_4spk_vs_8spk.csv (run_id={rid})",
+        samples.len()
+    );
+    eprintln!(
+        "4spk: {} ({} speakers) | 8spk: {} ({} speakers)",
+        sortformer_onnx().display(),
+        4,
+        sortformer_8spk_onnx().display(),
+        8
+    );
+}
+
+/// Grid-search 8spk post-processing on cached raw predictions (no ONNX re-run).
+/// Writes `samples/diarization_8spk_config_sweep.csv`. Set `PARAKEET_8SPK_SWEEP=1` to run
+/// (skipped by default — full ONNX pass over all samples still takes several minutes).
+#[cfg(feature = "sortformer")]
+#[test]
+fn diarization_8spk_postprocess_sweep() {
+    use parakeet_rs::sortformer::{DiarizationConfig, Sortformer};
+    use std::collections::HashMap;
+
+    if std::env::var("PARAKEET_8SPK_SWEEP").ok().as_deref() != Some("1") {
+        skip("diarization_8spk_postprocess_sweep", "set PARAKEET_8SPK_SWEEP=1");
+        return;
+    }
+    if !sortformer_8spk_available() {
+        skip("diarization_8spk_postprocess_sweep", "8spk model not found");
+        return;
+    }
+    if ep_skip_if_unavailable("diarization_8spk_postprocess_sweep") {
+        return;
+    }
+
+    fn config_label(cfg: &DiarizationConfig) -> String {
+        format!(
+            "o{:.2}_f{:.2}_m{}_on{:.2}_off{:.2}",
+            cfg.onset,
+            cfg.offset,
+            cfg.median_window,
+            cfg.min_duration_on,
+            cfg.min_duration_off
+        )
+    }
+
+    let mut candidates: Vec<(String, DiarizationConfig)> = vec![
+        ("callhome".into(), DiarizationConfig::callhome()),
+        ("dihard3".into(), DiarizationConfig::dihard3()),
+        ("ultra_8spk".into(), DiarizationConfig::ultra_8spk()),
+    ];
+    {
+        let mut sensitive = DiarizationConfig::custom(0.42, 0.32);
+        sensitive.min_duration_on = 0.15;
+        sensitive.min_duration_off = 0.10;
+        sensitive.median_window = 7;
+        candidates.push(("sensitive".into(), sensitive));
+    }
+    for &onset in &[0.40, 0.48, 0.54, 0.60] {
+        for &offset in &[0.32, 0.38, 0.45, 0.52] {
+            if offset >= onset {
+                continue;
+            }
+            for &median in &[7, 9, 11] {
+                let mut cfg = DiarizationConfig::custom(onset, offset);
+                cfg.median_window = median;
+                cfg.pad_onset = 0.12;
+                cfg.pad_offset = 0.04;
+                cfg.min_duration_on = 0.18;
+                cfg.min_duration_off = 0.10;
+                candidates.push((config_label(&cfg), cfg));
+            }
+        }
+    }
+
+    let mut sf = Sortformer::with_config(
+        sortformer_8spk_onnx(),
+        Some(execution_config()),
+        DiarizationConfig::ultra_8spk(),
+    )
+    .expect("load 8spk");
+
+    let samples = discover_samples();
+    let header = "config,sample,der,jer,num_hyp_speakers";
+
+    eprintln!("\n8spk post-processing sweep ({} configs × {} samples):", candidates.len(), samples.len());
+
+    let mut totals: HashMap<String, (f32, f32, usize, DiarizationConfig)> = HashMap::new();
+
+    for sample in &samples {
+        let (audio, _) = load_wav_mono_16k(&sample.wav);
+        let audio_secs = audio.len() as f32 / 16_000.0;
+        let n_samples = audio.len() as u64;
+        let raw_ref = std::fs::read_to_string(&sample.transcript).expect("read transcript");
+        let reference = parse_reference_turns(&raw_ref, audio_secs);
+
+        eprintln!("  ONNX inference: {} ({:.0}s)...", sample.name, audio_secs);
+        sf.reset_state();
+        let raw = sf.diarize_chunk_raw(&audio).expect("raw diarize");
+
+        for (name, cfg) in &candidates {
+            sf.set_postprocess_config(cfg.clone());
+            let segments = sf.postprocess_raw(&raw, n_samples);
+            let hyp: Vec<DiarSegment> = segments
+                .iter()
+                .map(|s| DiarSegment {
+                    speaker: s.speaker_id,
+                    start: s.start as f32 / 16_000.0,
+                    end: s.end as f32 / 16_000.0,
+                })
+                .collect();
+            let m = diarization_metrics(&reference, &hyp, audio_secs);
+            append_csv_row(
+                "diarization_8spk_config_sweep.csv",
+                header,
+                &format!(
+                    "{name},{},{:.4},{:.4},{}",
+                    sample.name, m.der, m.jer, m.num_hyp_speakers
+                ),
+            );
+            let entry = totals
+                .entry(name.clone())
+                .or_insert((0.0, 0.0, 0, cfg.clone()));
+            entry.0 += m.der;
+            entry.1 += m.jer;
+            entry.2 += 1;
+        }
+    }
+
+    let mut ranked: Vec<_> = totals
+        .into_iter()
+        .map(|(name, (der_sum, jer_sum, n, cfg))| {
+            let n = n.max(1) as f32;
+            (name, der_sum / n, jer_sum / n, cfg)
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    eprintln!("\nTop 10 configs by mean DER:");
+    eprintln!("{:<24} {:>8} {:>8}", "config", "DER", "JER");
+    for (name, der, jer, _) in ranked.iter().take(10) {
+        eprintln!("{:<24} {:>7.1}% {:>7.1}%", name, der * 100.0, jer * 100.0);
+    }
+    if let Some((best_name, best_der, best_jer, best_cfg)) = ranked.first() {
+        eprintln!(
+            "\nBest: {best_name}  mean DER {:.1}%  mean JER {:.1}%",
+            best_der * 100.0,
+            best_jer * 100.0
+        );
+        eprintln!(
+            "  onset={:.3} offset={:.3} median={} min_on={:.2} min_off={:.2} pad_on={:.2} pad_off={:.2}",
+            best_cfg.onset,
+            best_cfg.offset,
+            best_cfg.median_window,
+            best_cfg.min_duration_on,
+            best_cfg.min_duration_off,
+            best_cfg.pad_onset,
+            best_cfg.pad_offset
+        );
+    }
 }
 
 /// Exercise Sortformer's streaming API (`diarize_chunk` + `flush`) to ensure the

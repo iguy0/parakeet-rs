@@ -135,21 +135,22 @@ impl DiarizationConfig {
 
     /// Post-processing preset for Ultra Sortformer 8-speaker ONNX exports.
     ///
-    /// NVIDIA CallHome thresholds are too strict for 8-way sigmoid heads: per-speaker
-    /// activations are typically lower when more channels compete. This preset uses
-    /// lower onset/offset, shorter minimum segment duration, and slightly less median
-    /// smoothing than `callhome()`.
+    /// Tuned on multi-speaker meeting samples (committee, datascience-staff-meeting)
+    /// plus a short 2-speaker smoke clip via `diarization_8spk_postprocess_sweep`.
+    /// Uses slightly lower offset than NVIDIA CallHome but higher onset than the
+    /// initial heuristic, with CallHome-class median smoothing (`11`).
     ///
-    /// Start here for `num_speakers > 4`; refine with `custom()` on your own audio.
+    /// Clips shorter than the model latency (~30.4 s) still under-perform; prefer
+    /// longer audio or `dihard3()` for very short clips.
     pub fn ultra_8spk() -> Self {
         Self {
-            onset: 0.48,
+            onset: 0.56,
             offset: 0.38,
-            pad_onset: 0.15,
-            pad_offset: 0.05,
-            min_duration_on: 0.20,
-            min_duration_off: 0.12,
-            median_window: 9,
+            pad_onset: 0.12,
+            pad_offset: 0.04,
+            min_duration_on: 0.18,
+            min_duration_off: 0.10,
+            median_window: 11,
         }
     }
 
@@ -464,6 +465,38 @@ impl Sortformer {
             predictions: full_preds,
             num_valid_frames,
         })
+    }
+
+    /// Update post-processing thresholds without reloading the ONNX session.
+    pub fn set_postprocess_config(&mut self, config: DiarizationConfig) {
+        self.config = config;
+    }
+
+    /// Apply median filtering and hysteresis binarization to raw frame predictions.
+    /// Use after [`diarize_chunk_raw`] to tune [`DiarizationConfig`] without re-running ONNX.
+    pub fn postprocess_raw(
+        &self,
+        raw: &RawDiarizationPredictions,
+        n_audio_samples: u64,
+    ) -> Vec<SpeakerSegment> {
+        let preds = if raw.num_valid_frames < raw.predictions.nrows() {
+            raw.predictions.slice(s![..raw.num_valid_frames, ..]).to_owned()
+        } else {
+            raw.predictions.clone()
+        };
+
+        let filtered_preds = if self.config.median_window > 1 {
+            self.median_filter(&preds)
+        } else {
+            preds
+        };
+
+        let mut segments = self.binarize(&filtered_preds);
+        for seg in &mut segments {
+            seg.end = seg.end.min(n_audio_samples);
+        }
+        segments.retain(|s| s.end > s.start);
+        segments
     }
 
     /// Feed audio samples for buffered streaming diarization.
