@@ -191,6 +191,8 @@ impl ModelConfig {
             builder = builder
                 .with_parallel_execution(false)?
                 .with_memory_pattern(false)?;
+        } else {
+            builder = builder.with_memory_pattern(true)?;
         }
 
         builder = match self.execution_provider {

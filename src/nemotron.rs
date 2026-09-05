@@ -1048,7 +1048,7 @@ impl Nemotron {
                 )?;
 
                 let (max_idx, max_val) =
-                    crate::tensor_utils::argmax_f32(logits.iter().copied());
+                    crate::tensor_utils::argmax_f32_iter(logits.iter().copied());
 
                 if max_idx == self.blank_id {
                     break;

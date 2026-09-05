@@ -223,7 +223,7 @@ impl ParakeetEOU {
                 apply_blank_penalty(logits.slice_mut(s![0, 0, ..]), self.blank_penalty);
                 let vocab = logits.slice(s![0, 0, ..]);
 
-                let (max_idx, _) = crate::tensor_utils::argmax_f32(vocab.iter().copied());
+                let (max_idx, _) = crate::tensor_utils::argmax_f32_iter(vocab.iter().copied());
                 let max_idx = max_idx as i32;
 
                 if max_idx == self.blank_id || max_idx == 0 {

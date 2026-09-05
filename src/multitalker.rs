@@ -618,7 +618,7 @@ impl MultitalkerASR {
                     &self.speakers[spk_idx].state_2,
                 )?;
 
-                let (max_idx, _) = crate::tensor_utils::argmax_f32(logits.iter().copied());
+                let (max_idx, _) = crate::tensor_utils::argmax_f32_iter(logits.iter().copied());
 
                 if max_idx == BLANK_ID {
                     break;

@@ -70,6 +70,10 @@ pub mod multitalker;
 mod model_cohere;
 #[cfg(feature = "cohere")]
 pub mod cohere;
+#[cfg(feature = "ark-asr")]
+mod model_ark;
+#[cfg(feature = "ark-asr")]
+pub mod ark_asr;
 mod tensor_utils;
 mod timestamps;
 mod transcriber;
@@ -83,7 +87,10 @@ pub use timestamps::TimestampMode;
 pub use transcriber::*;
 
 pub use audio::FeatureCache;
-pub use config::{ModelConfig as ModelConfigJson, PreprocessorConfig};
+pub use config::{
+    CtcConfig, CtcFrontendConfig, ModelConfig as ModelConfigJson, NormalizationMode,
+    PreprocessorConfig,
+};
 
 pub use decoder::{ParakeetDecoder, TimedToken, TranscriptionResult};
 pub use decoding::{
@@ -103,3 +110,6 @@ pub use multitalker::{LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTra
 
 #[cfg(feature = "cohere")]
 pub use cohere::CohereASR;
+
+#[cfg(feature = "ark-asr")]
+pub use ark_asr::ArkAsr;

@@ -72,8 +72,46 @@ pub(crate) fn extract_scalar_i64(value: &DynValue, name: &str) -> Result<i64> {
         .ok_or_else(|| Error::Model(format!("Empty tensor for {name}")))
 }
 
-/// Greedy argmax over f32 logits: index and value of the first maximum
-pub(crate) fn argmax_f32(values: impl IntoIterator<Item = f32>) -> (usize, f32) {
+/// Greedy argmax over f32 logits: index and value of the first maximum.
+pub(crate) fn argmax_f32(values: &[f32]) -> (usize, f32) {
+    let mut max_idx = 0usize;
+    let mut max_val = f32::NEG_INFINITY;
+    let mut i = 0usize;
+    while i + 4 <= values.len() {
+        let v0 = values[i];
+        let v1 = values[i + 1];
+        let v2 = values[i + 2];
+        let v3 = values[i + 3];
+        if v0 > max_val {
+            max_val = v0;
+            max_idx = i;
+        }
+        if v1 > max_val {
+            max_val = v1;
+            max_idx = i + 1;
+        }
+        if v2 > max_val {
+            max_val = v2;
+            max_idx = i + 2;
+        }
+        if v3 > max_val {
+            max_val = v3;
+            max_idx = i + 3;
+        }
+        i += 4;
+    }
+    while i < values.len() {
+        let v = values[i];
+        if v > max_val {
+            max_val = v;
+            max_idx = i;
+        }
+        i += 1;
+    }
+    (max_idx, max_val)
+}
+
+pub(crate) fn argmax_f32_iter(values: impl IntoIterator<Item = f32>) -> (usize, f32) {
     let mut max_idx = 0;
     let mut max_val = f32::NEG_INFINITY;
     for (i, v) in values.into_iter().enumerate() {
@@ -91,9 +129,9 @@ mod tests {
 
     #[test]
     fn argmax_picks_first_maximum() {
-        assert_eq!(argmax_f32([0.1, 0.5, 0.3, 0.9, 0.2]).0, 3);
-        assert_eq!(argmax_f32([1.0, 0.0, 1.0]).0, 0);
-        assert_eq!(argmax_f32([f32::NAN, 0.5, 0.3]).0, 1);
-        assert_eq!(argmax_f32([]), (0, f32::NEG_INFINITY));
+        assert_eq!(argmax_f32(&[0.1, 0.5, 0.3, 0.9, 0.2]).0, 3);
+        assert_eq!(argmax_f32(&[1.0, 0.0, 1.0]).0, 0);
+        assert_eq!(argmax_f32(&[f32::NAN, 0.5, 0.3]).0, 1);
+        assert_eq!(argmax_f32(&[]), (0, f32::NEG_INFINITY));
     }
 }

@@ -56,16 +56,14 @@ impl Parakeet {
 
         // Determine if path is a directory or file
         let (model_path, tokenizer_path, model_dir) = if path.is_dir() {
-            // Directory mode: auto-detect model file
             let model_path = Self::find_model_file(path)?;
-            let tokenizer_path = path.join("tokenizer.json");
+            let tokenizer_path = Self::find_tokenizer(path, &model_path)?;
             (model_path, tokenizer_path, path.to_path_buf())
         } else if path.is_file() {
-            // File mode: path points directly to model file
             let model_dir = path
                 .parent()
                 .ok_or_else(|| Error::Config("Invalid model path".to_string()))?;
-            let tokenizer_path = model_dir.join("tokenizer.json");
+            let tokenizer_path = Self::find_tokenizer(model_dir, path)?;
             (path.to_path_buf(), tokenizer_path, model_dir.to_path_buf())
         } else {
             return Err(Error::Config(format!(
@@ -74,19 +72,13 @@ impl Parakeet {
             )));
         };
 
-        // Check tokenizer exists
-        if !tokenizer_path.exists() {
-            return Err(Error::Config(format!(
-                "Required file 'tokenizer.json' not found in {}",
-                model_dir.display()
-            )));
-        }
-
         let preprocessor_config = PreprocessorConfig::default();
         let exec_config = config.unwrap_or_default();
 
         let model = ParakeetModel::from_pretrained_with_config(&model_path, exec_config)?;
-        let decoder = ParakeetDecoder::from_pretrained(&tokenizer_path)?;
+        let ctc_config = model.ctc_config();
+        let decoder =
+            ParakeetDecoder::from_pretrained_with_ctc_config(&tokenizer_path, ctc_config)?;
         let feature_cache = FeatureCache::from_config(&preprocessor_config);
 
         Ok(Self {
@@ -116,25 +108,51 @@ impl Parakeet {
             "model_q4.onnx",
         ];
 
-        for candidate in &candidates {
-            let path = dir.join(candidate);
-            if path.exists() {
-                return Ok(path);
+        let search_dirs = [dir.to_path_buf(), dir.join("onnx")];
+        for search in &search_dirs {
+            for candidate in &candidates {
+                let path = search.join(candidate);
+                if path.exists() {
+                    return Ok(path);
+                }
             }
         }
 
-        // If none of the standard names found, search for any .onnx file
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("onnx") {
-                    return Ok(path);
+        for search in &search_dirs {
+            if let Ok(entries) = std::fs::read_dir(search) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("onnx") {
+                        return Ok(path);
+                    }
                 }
             }
         }
 
         Err(Error::Config(format!(
             "No model file (*.onnx) found in directory: {}",
+            dir.display()
+        )))
+    }
+
+    fn find_tokenizer(dir: &Path, model_path: &Path) -> Result<PathBuf> {
+        let mut candidates = vec![
+            dir.join("tokenizer.json"),
+            dir.join("onnx").join("tokenizer.json"),
+        ];
+        if let Some(parent) = model_path.parent() {
+            candidates.push(parent.join("tokenizer.json"));
+            if let Some(grand) = parent.parent() {
+                candidates.push(grand.join("tokenizer.json"));
+            }
+        }
+        for path in candidates {
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+        Err(Error::Config(format!(
+            "Required file 'tokenizer.json' not found in {} (or next to the ONNX file)",
             dir.display()
         )))
     }
@@ -155,22 +173,32 @@ impl Transcriber for Parakeet {
         channels: u16,
         mode: Option<TimestampMode>,
     ) -> Result<TranscriptionResult> {
-        let features = audio::extract_features_with_cache(
+        let features = audio::extract_features_with_frontend(
             audio,
             sample_rate,
             channels,
             &self.preprocessor_config,
             &self.feature_cache,
+            &self.model.ctc_config().frontend,
         )?;
-        let logits = self.model.forward(features)?;
-
+        let feature_frames = features.shape()[0];
         let mut result = match self.decoding {
-            DecodingStrategy::Greedy => self.decoder.decode_with_timestamps(
-                &logits,
-                self.preprocessor_config.hop_length,
-                self.preprocessor_config.sampling_rate,
-            )?,
+            DecodingStrategy::Greedy => {
+                let ids = self.model.forward_frame_ids(features)?;
+                let ctc = self.model.ctc_config();
+                let frame_shift = ctc.logit_shift_samples_for(
+                    self.preprocessor_config.hop_length,
+                    feature_frames,
+                    ids.len(),
+                );
+                self.decoder.decode_ids_with_timestamps(
+                    &ids,
+                    frame_shift,
+                    self.preprocessor_config.sampling_rate,
+                )?
+            }
             DecodingStrategy::Beam(config) => {
+                let logits = self.model.forward(features)?;
                 let text = self.decoder.decode_with_beam_config(&logits, &config)?;
                 TranscriptionResult {
                     text,

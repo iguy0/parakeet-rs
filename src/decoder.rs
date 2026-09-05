@@ -1,5 +1,7 @@
+use crate::config::CtcConfig;
 use crate::decoding::{decode_ctc_beam, BeamConfig};
 use crate::error::{Error, Result};
+use crate::tensor_utils::argmax_f32;
 use ndarray::Array2;
 use std::path::Path;
 
@@ -18,60 +20,52 @@ pub struct TranscriptionResult {
     pub tokens: Vec<TimedToken>,
 }
 
-// CTC decoder for parakeet-ctc-0.6b model with token-level timestamps
+// CTC decoder for parakeet-ctc-0.6b (and metadata-configured CTC variants)
 pub struct ParakeetDecoder {
     tokenizer: tokenizers::Tokenizer,
-    pad_token_id: usize,
+    blank_id: usize,
+    token_id_offset: i32,
 }
 
 impl ParakeetDecoder {
     pub fn from_pretrained<P: AsRef<Path>>(tokenizer_path: P) -> Result<Self> {
+        Self::from_pretrained_with_ctc_config(tokenizer_path, CtcConfig::default())
+    }
+
+    pub fn from_pretrained_with_ctc_config<P: AsRef<Path>>(
+        tokenizer_path: P,
+        ctc: CtcConfig,
+    ) -> Result<Self> {
         let tokenizer_path = tokenizer_path.as_ref();
 
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
             .map_err(|e| Error::Tokenizer(format!("Failed to load tokenizer: {e}")))?;
 
-        // Hardcoded pad_token_id for Parakeet-CTC-0.6b (constant across all models: please see def configs jsons: https://huggingface.co/onnx-community/parakeet-ctc-0.6b-ONNX/tree/main)
-        let pad_token_id = 1024;
-
         Ok(Self {
             tokenizer,
-            pad_token_id,
+            blank_id: ctc.blank_id as usize,
+            token_id_offset: ctc.token_id_offset,
         })
     }
 
     pub fn decode(&self, logits: &Array2<f32>) -> Result<String> {
-        let time_steps = logits.shape()[0];
-
-        let mut token_ids = Vec::new();
-        for t in 0..time_steps {
-            let logits_t = logits.row(t);
-            let max_idx = logits_t
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
-
-            token_ids.push(max_idx as u32);
+        let mut token_ids = Vec::with_capacity(logits.shape()[0]);
+        for row in logits.rows() {
+            token_ids.push(argmax_row(&row));
         }
-
-        let collapsed = self.ctc_collapse(&token_ids);
-
-        let text = self
-            .tokenizer
+        let collapsed = self.apply_token_offset(&self.ctc_collapse(&token_ids));
+        self.tokenizer
             .decode(&collapsed, true)
-            .map_err(|e| Error::Tokenizer(format!("Failed to decode: {e}")))?;
-
-        Ok(text)
+            .map_err(|e| Error::Tokenizer(format!("Failed to decode: {e}")))
     }
 
     fn ctc_collapse(&self, token_ids: &[u32]) -> Vec<u32> {
         let mut result = Vec::new();
         let mut prev_token: Option<u32> = None;
+        let blank = self.blank_id as u32;
 
         for &token_id in token_ids {
-            if token_id == self.pad_token_id as u32 {
+            if token_id == blank {
                 prev_token = Some(token_id);
                 continue;
             }
@@ -86,20 +80,34 @@ impl ParakeetDecoder {
         result
     }
 
+    fn apply_token_offset(&self, token_ids: &[u32]) -> Vec<u32> {
+        if self.token_id_offset == 0 {
+            return token_ids.to_vec();
+        }
+        token_ids
+            .iter()
+            .filter_map(|&id| {
+                let shifted = id as i32 - self.token_id_offset;
+                (shifted >= 0).then_some(shifted as u32)
+            })
+            .collect()
+    }
+
     // CTC collapse with frame tracking for timestamps
     fn ctc_collapse_with_frames(&self, token_ids: &[(u32, usize)]) -> Vec<(u32, usize, usize)> {
         let mut result: Vec<(u32, usize, usize)> = Vec::new();
         let mut prev_token: Option<u32> = None;
+        let blank = self.blank_id as u32;
 
         for &(token_id, frame) in token_ids.iter() {
-            if token_id == self.pad_token_id as u32 {
+            if token_id == blank {
                 prev_token = Some(token_id);
                 continue;
             }
 
             if Some(token_id) != prev_token {
                 if let Some(prev) = prev_token
-                    && prev != self.pad_token_id as u32
+                    && prev != blank
                 {
                     // End previous token
                     if let Some(last) = result.last_mut() {
@@ -121,80 +129,84 @@ impl ParakeetDecoder {
         result
     }
 
-    // Decode with token-level timestamps
-    // hop_length and sample_rate are needed to convert frames to seconds
+    // Decode with token-level timestamps.
+    // `frame_shift_samples` is samples per logit frame (hop * stack * encoder subsample).
     pub fn decode_with_timestamps(
         &self,
         logits: &Array2<f32>,
-        hop_length: usize,
+        frame_shift_samples: usize,
         sample_rate: usize,
     ) -> Result<TranscriptionResult> {
-        let time_steps = logits.shape()[0];
-
-        let mut token_ids_with_frames = Vec::new();
-        for t in 0..time_steps {
-            let logits_t = logits.row(t);
-            let max_idx = logits_t
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
-
-            token_ids_with_frames.push((max_idx as u32, t));
+        let mut frame_ids = Vec::with_capacity(logits.shape()[0]);
+        for row in logits.rows() {
+            frame_ids.push(argmax_row(&row));
         }
+        self.decode_ids_with_timestamps(&frame_ids, frame_shift_samples, sample_rate)
+    }
 
-        // CTC collapse with frame tracking
+    /// Greedy CTC collapse + timestamps from per-frame argmax ids (one id per logit frame).
+    pub fn decode_ids_with_timestamps(
+        &self,
+        frame_ids: &[u32],
+        frame_shift_samples: usize,
+        sample_rate: usize,
+    ) -> Result<TranscriptionResult> {
+        let token_ids_with_frames: Vec<(u32, usize)> = frame_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(t, id)| (id, t))
+            .collect();
+
         let collapsed_with_frames = self.ctc_collapse_with_frames(&token_ids_with_frames);
+        let collapsed_with_frames: Vec<(u32, usize, usize)> = collapsed_with_frames
+            .into_iter()
+            .filter_map(|(id, start, end)| {
+                let shifted = id as i32 - self.token_id_offset;
+                (shifted >= 0).then_some((shifted as u32, start, end))
+            })
+            .collect();
 
-        // Extract just token IDs for decoding
         let token_ids: Vec<u32> = collapsed_with_frames.iter().map(|(id, _, _)| *id).collect();
-
-        // Decode full text
         let full_text = self
             .tokenizer
             .decode(&token_ids, true)
             .map_err(|e| Error::Tokenizer(format!("Failed to decode: {e}")))?;
 
-        // Progressive decode to detect word boundaries
-        // BPE tokenizers only add spaces when decoding sequences, not individual tokens
-        let mut timed_tokens = Vec::new();
-        let mut prev_decode = String::new();
-
-        for (i, (_token_id, start_frame, end_frame)) in collapsed_with_frames.iter().enumerate() {
-            // Decode from start up to and including current token
-            let token_ids_so_far: Vec<u32> = collapsed_with_frames[0..=i]
-                .iter()
-                .map(|(id, _, _)| *id)
-                .collect();
-
-            if let Ok(curr_decode) = self.tokenizer.decode(&token_ids_so_far, true) {
-                // Find what this token added
-                let added_text = if curr_decode.len() > prev_decode.len() {
-                    &curr_decode[prev_decode.len()..]
-                } else {
-                    ""
-                };
-
-                if !added_text.is_empty() {
-                    let start_time = (*start_frame * hop_length) as f32 / sample_rate as f32;
-                    let end_time = (*end_frame * hop_length) as f32 / sample_rate as f32;
-
-                    timed_tokens.push(TimedToken {
-                        text: added_text.to_string(),
-                        start: start_time,
-                        end: end_time,
-                    });
-                }
-
-                prev_decode = curr_decode;
+        let shift = frame_shift_samples.max(1);
+        let sr = sample_rate.max(1) as f32;
+        let mut timed_tokens = Vec::with_capacity(collapsed_with_frames.len());
+        for (id, start_frame, end_frame) in &collapsed_with_frames {
+            let added_text = self.piece_text(*id);
+            if added_text.is_empty() {
+                continue;
             }
+            timed_tokens.push(TimedToken {
+                text: added_text,
+                start: (*start_frame * shift) as f32 / sr,
+                end: (*end_frame * shift) as f32 / sr,
+            });
         }
 
         Ok(TranscriptionResult {
             text: full_text,
             tokens: timed_tokens,
         })
+    }
+
+    /// Map one tokenizer id to surface text (leading `Ġ`/`▁` become spaces).
+    fn piece_text(&self, id: u32) -> String {
+        let Some(tok) = self.tokenizer.id_to_token(id) else {
+            return String::new();
+        };
+        if (tok.starts_with("<|") && tok.ends_with("|>"))
+            || tok == "[PAD]"
+            || tok == "<pad>"
+            || tok == "<blank>"
+        {
+            return String::new();
+        }
+        tok.replace('▁', " ").replace('Ġ', " ")
     }
 
     /// CTC prefix beam search (no language model). Timestamp alignment is not
@@ -218,7 +230,8 @@ impl ParakeetDecoder {
         logits: &Array2<f32>,
         config: &BeamConfig,
     ) -> Result<String> {
-        let collapsed = decode_ctc_beam(logits, self.pad_token_id, config);
+        let collapsed = decode_ctc_beam(logits, self.blank_id, config);
+        let collapsed = self.apply_token_offset(&collapsed);
         let text = self
             .tokenizer
             .decode(&collapsed, true)
@@ -227,6 +240,22 @@ impl ParakeetDecoder {
     }
 
     pub fn pad_token_id(&self) -> usize {
-        self.pad_token_id
+        self.blank_id
+    }
+
+    pub fn blank_id(&self) -> usize {
+        self.blank_id
+    }
+
+    pub fn token_id_offset(&self) -> i32 {
+        self.token_id_offset
+    }
+}
+
+fn argmax_row(row: &ndarray::ArrayView1<f32>) -> u32 {
+    if let Some(s) = row.as_slice() {
+        argmax_f32(s).0 as u32
+    } else {
+        crate::tensor_utils::argmax_f32_iter(row.iter().copied()).0 as u32
     }
 }
