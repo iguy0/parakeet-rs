@@ -25,15 +25,18 @@ pub struct ParakeetTDTModel {
 }
 
 impl ParakeetTDTModel {
-    /// Load TDT model from directory containing encoder and decoder_joint ONNX files
+    /// Load a TDT model, running the encoder and the decoder/joint under separate execution
+    /// configurations.
     ///
     /// # Arguments
     /// * `model_dir` - Directory containing encoder and decoder_joint ONNX files
-    /// * `exec_config` - Execution configuration for ONNX runtime
+    /// * `exec_config` - Execution configuration for the encoder session
+    /// * `joint_config` - Execution configuration for the decoder/joint session
     /// * `vocab_size` - Vocabulary size (number of tokens including blank)
-    pub fn from_pretrained<P: AsRef<Path>>(
+    pub fn from_pretrained_with_configs<P: AsRef<Path>>(
         model_dir: P,
         exec_config: ExecutionConfig,
+        joint_config: ExecutionConfig,
         vocab_size: usize,
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
@@ -45,7 +48,7 @@ impl ParakeetTDTModel {
         let config = TDTModelConfig::new(vocab_size);
 
         let encoder = exec_config.build_session(&encoder_path)?;
-        let decoder_joint = exec_config.build_session(&decoder_joint_path)?;
+        let decoder_joint = joint_config.build_session(&decoder_joint_path)?;
 
         Ok(Self {
             encoder,
@@ -70,10 +73,11 @@ impl ParakeetTDTModel {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if name.starts_with("encoder") && name.ends_with(".onnx") {
-                        return Ok(path);
-                    }
+                if let Some(name) = path.file_name().and_then(|s| s.to_str())
+                    && name.starts_with("encoder")
+                    && name.ends_with(".onnx")
+                {
+                    return Ok(path);
                 }
             }
         }

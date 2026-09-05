@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::{fmt, rc::Rc};
+use std::{fmt, sync::Arc};
 
 use crate::error::Result;
 use ort::session::builder::SessionBuilder;
@@ -51,7 +51,7 @@ pub struct ModelConfig {
     pub execution_provider: ExecutionProvider,
     pub intra_threads: usize,
     pub inter_threads: usize,
-    pub configure: Option<Rc<dyn Fn(SessionBuilder) -> ort::Result<SessionBuilder>>>,
+    pub configure: Option<Arc<dyn Fn(SessionBuilder) -> ort::Result<SessionBuilder> + Send + Sync>>,
     /// Optional cache directory for compiled CoreML models. When set, avoids
     /// recompiling the ONNX-to-CoreML conversion on each session load (~5s).
     /// Only used when execution_provider is CoreML.
@@ -122,9 +122,9 @@ impl ModelConfig {
 
     pub fn with_custom_configure(
         mut self,
-        configure: impl Fn(SessionBuilder) -> ort::Result<SessionBuilder> + 'static,
+        configure: impl Fn(SessionBuilder) -> ort::Result<SessionBuilder> + Send + Sync + 'static,
     ) -> Self {
-        self.configure = Some(Rc::new(configure));
+        self.configure = Some(Arc::new(configure));
         self
     }
 
@@ -149,7 +149,8 @@ impl ModelConfig {
         self
     }
 
-    pub(crate) fn build_session(&self, path: &Path) -> Result<Session> {
+    /// Build a session for `path` under this configuration.
+    pub fn build_session(&self, path: &Path) -> Result<Session> {
         let builder = Session::builder()?;
         let mut builder = self.apply_to_session_builder(builder)?;
         Ok(builder.commit_from_file(path)?)

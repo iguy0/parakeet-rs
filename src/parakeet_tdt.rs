@@ -31,13 +31,57 @@ impl ParakeetTDT {
         path: P,
         config: Option<ExecutionConfig>,
     ) -> Result<Self> {
-        Self::from_pretrained_with_decoding(path, config, DecodingStrategy::Greedy)
+        let joint_config = config.clone();
+        Self::from_pretrained_full(path, config, joint_config, DecodingStrategy::Greedy)
     }
 
     /// Load Parakeet TDT with an explicit decoding strategy (greedy default, or beam).
     pub fn from_pretrained_with_decoding<P: AsRef<Path>>(
         path: P,
         config: Option<ExecutionConfig>,
+        decoding: DecodingStrategy,
+    ) -> Result<Self> {
+        let joint_config = config.clone();
+        Self::from_pretrained_full(path, config, joint_config, decoding)
+    }
+
+    /// Load Parakeet TDT model from path, running the decoder/joint graph under its own execution
+    /// configuration.
+    ///
+    /// The encoder and the decoder/joint are separate ONNX graphs and do not have to run on the
+    /// same execution provider. Splitting them matters when a provider can take one graph and not
+    /// the other, and the joint runs once per token, so where it runs is a decision of its own.
+    ///
+    /// # Arguments
+    /// * `path` - Directory containing encoder-model.onnx, decoder_joint-model.onnx, and vocab.txt
+    /// * `config` - Optional execution configuration for the encoder (defaults to CPU if None)
+    /// * `joint_config` - Optional execution configuration for the decoder/joint (defaults to CPU
+    ///   if None)
+    pub fn from_pretrained_with_joint_config<P: AsRef<Path>>(
+        path: P,
+        config: Option<ExecutionConfig>,
+        joint_config: Option<ExecutionConfig>,
+    ) -> Result<Self> {
+        Self::from_pretrained_full(path, config, joint_config, DecodingStrategy::Greedy)
+    }
+
+    /// Load Parakeet TDT model from path, with an explicit decoder/joint execution
+    /// configuration and decoding strategy (greedy default, or beam). See
+    /// [`Self::from_pretrained_with_joint_config`] and [`Self::from_pretrained_with_decoding`]
+    /// for details on each parameter.
+    pub fn from_pretrained_with_joint_config_and_decoding<P: AsRef<Path>>(
+        path: P,
+        config: Option<ExecutionConfig>,
+        joint_config: Option<ExecutionConfig>,
+        decoding: DecodingStrategy,
+    ) -> Result<Self> {
+        Self::from_pretrained_full(path, config, joint_config, decoding)
+    }
+
+    fn from_pretrained_full<P: AsRef<Path>>(
+        path: P,
+        config: Option<ExecutionConfig>,
+        joint_config: Option<ExecutionConfig>,
         decoding: DecodingStrategy,
     ) -> Result<Self> {
         let path = path.as_ref();
@@ -73,12 +117,18 @@ impl ParakeetTDT {
         };
 
         let exec_config = config.unwrap_or_default();
+        let joint_exec_config = joint_config.unwrap_or_default();
 
         // Load vocab first to get the actual vocabulary size
         let vocab = Vocabulary::from_file(&vocab_path)?;
         let vocab_size = vocab.size();
 
-        let model = ParakeetTDTModel::from_pretrained(path, exec_config, vocab_size)?;
+        let model = ParakeetTDTModel::from_pretrained_with_configs(
+            path,
+            exec_config,
+            joint_exec_config,
+            vocab_size,
+        )?;
         let decoder = ParakeetTDTDecoder::from_vocab(vocab);
         let feature_cache = FeatureCache::from_config(&preprocessor_config);
 
