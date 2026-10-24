@@ -72,6 +72,23 @@ pub fn sortformer_available() -> bool {
     sortformer_onnx().exists()
 }
 
+/// Diarization post-processing preset for the benchmarks. `PARAKEET_DIAR_PRESET` selects
+/// `callhome` (default), `dihard3`, `ultra8` (8-speaker), or `nemotron3`.
+#[cfg(feature = "sortformer")]
+pub fn diar_config() -> parakeet_rs::sortformer::DiarizationConfig {
+    use parakeet_rs::sortformer::DiarizationConfig;
+    match std::env::var("PARAKEET_DIAR_PRESET")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "dihard3" => DiarizationConfig::dihard3(),
+        "ultra8" | "ultra_8spk" => DiarizationConfig::ultra_8spk(),
+        "nemotron3" => DiarizationConfig::nemotron3(),
+        _ => DiarizationConfig::callhome(),
+    }
+}
+
 // Additional ASR model dirs (env-overridable; default under models/). None are
 // committed; tests skip when absent.
 pub fn ctc_dir() -> PathBuf {
@@ -200,6 +217,14 @@ pub fn discover_samples() -> Vec<Sample> {
         }
         if let (Some(wav), Some(transcript)) = (wav, transcript) {
             out.push(Sample { name, wav, transcript });
+        }
+    }
+    // Optional comma-separated allow-list (e.g. `PARAKEET_BENCH_SAMPLES=smoke,committee`)
+    // to keep slow configurations (low-latency streaming presets) tractable.
+    if let Ok(filter) = std::env::var("PARAKEET_BENCH_SAMPLES") {
+        let wanted: Vec<&str> = filter.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        if !wanted.is_empty() {
+            out.retain(|s| wanted.contains(&s.name.as_str()));
         }
     }
     out

@@ -24,7 +24,7 @@
 
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig;
-use ndarray::{s, Array1, Array2, Array3, Axis};
+use ndarray::{s, Array1, Array2, Array3, ArrayView2, Axis};
 use ort::session::Session;
 use realfft::RealFftPlanner;
 use std::f32::consts::PI;
@@ -153,6 +153,25 @@ impl DiarizationConfig {
         }
     }
 
+    /// Post-processing preset for `nvidia/Nemotron-3-Diarization` ONNX exports.
+    ///
+    /// Slightly more sensitive than `callhome()` (lower onset/offset, shorter median window):
+    /// on the two long meeting clips in `samples/` it lowered mean DER by about 0.7 points
+    /// (15.3% -> 14.6%) with the INT8 offline export. It was tuned on only those clips, so treat
+    /// it as a starting point and confirm on your own audio; `callhome()` remains a sound default.
+    /// The model's missed-speech rate on many-speaker recordings is not a threshold issue.
+    pub fn nemotron3() -> Self {
+        Self {
+            onset: 0.50,
+            offset: 0.30,
+            pad_onset: 0.229,
+            pad_offset: 0.079,
+            min_duration_on: 0.511,
+            min_duration_off: 0.296,
+            median_window: 7,
+        }
+    }
+
     /// Pick a reasonable default post-processing preset for the model's speaker count.
     pub fn for_num_speakers(num_speakers: usize) -> Self {
         if num_speakers > DEFAULT_NUM_SPEAKERS {
@@ -257,6 +276,130 @@ pub fn graph_window(session: &Session) -> Option<StreamingWindow> {
     Some((dim("chunk")?, dim("spkcache")?, dim("fifo")?))
 }
 
+/// One processed streaming window (internal): absolute start, audio span, raw predictions.
+struct StreamWindow {
+    sample_offset: u64,
+    span_samples: u64,
+    preds: Array2<f32>,
+}
+
+/// Cross-window post-processing state for `feed`/`flush`.
+///
+/// Keeps a short rolling buffer of raw 80 ms probabilities and re-runs the exact offline
+/// median filter + binarization over it, emitting a segment only once it can no longer change
+/// (it has ended and no later activity could merge into it). Segments are therefore identical
+/// to offline post-processing, independent of the model's window size, at the cost of a
+/// finalization delay of a few frames plus `min_duration_off`.
+struct StreamPost {
+    /// Buffered raw frames, one row per 80 ms frame.
+    preds: Array2<f32>,
+    /// Absolute frame index of `preds` row 0.
+    base_frame: u64,
+    /// Per speaker: absolute end sample of the last emitted segment.
+    last_emitted_end: Vec<u64>,
+}
+
+impl StreamPost {
+    fn new(num_speakers: usize) -> Self {
+        Self {
+            preds: Array2::zeros((0, num_speakers)),
+            base_frame: 0,
+            last_emitted_end: vec![0; num_speakers],
+        }
+    }
+
+    fn reset(&mut self, num_speakers: usize) {
+        *self = Self::new(num_speakers);
+    }
+
+    /// Append `new_frames` and return the segments that became final. With
+    /// `finalize = Some(total_samples)` the stream is ended: everything pending is emitted,
+    /// clipped to `total_samples`, and the buffer is cleared.
+    fn process(
+        &mut self,
+        config: &DiarizationConfig,
+        new_frames: &[Array2<f32>],
+        finalize: Option<u64>,
+    ) -> Vec<SpeakerSegment> {
+        let num_speakers = self.last_emitted_end.len();
+        let mut parts: Vec<ArrayView2<f32>> = Vec::with_capacity(new_frames.len() + 1);
+        if self.preds.nrows() > 0 {
+            parts.push(self.preds.view());
+        }
+        parts.extend(new_frames.iter().filter(|p| p.nrows() > 0).map(|p| p.view()));
+        if parts.is_empty() {
+            return Vec::new();
+        }
+        self.preds = if parts.len() == 1 {
+            parts[0].to_owned()
+        } else {
+            ndarray::concatenate(Axis(0), &parts).unwrap()
+        };
+
+        let spf = (FRAME_DURATION * SAMPLE_RATE as f32) as u64;
+        let n_rel = self.preds.nrows() as u64;
+        let base_sample = self.base_frame * spf;
+        let half = (config.median_window / 2) as u64;
+
+        let clip = match finalize {
+            Some(total) => total.saturating_sub(base_sample),
+            None => n_rel * spf,
+        };
+        let candidates = Sortformer::post_process(config, &self.preds, clip);
+
+        // A segment is final when no later activity can start close enough to merge with it.
+        // Frames within the median-filter reach of the buffer end may still change.
+        let min_off = (config.min_duration_off * SAMPLE_RATE as f32) as u64;
+        let pad_on = (config.pad_onset * SAMPLE_RATE as f32) as u64;
+        let horizon_frame = n_rel.saturating_sub(half + 1);
+        let horizon_sample = horizon_frame * spf;
+
+        let mut emitted = Vec::new();
+        let mut pending_start_frame: Option<u64> = None;
+        for seg in candidates {
+            let abs_start = base_sample + seg.start;
+            let abs_end = base_sample + seg.end;
+            // Remnant of an already-emitted segment (buffer was trimmed inside it).
+            if abs_start < self.last_emitted_end[seg.speaker_id] {
+                continue;
+            }
+            let is_final = finalize.is_some() || seg.end + min_off + pad_on <= horizon_sample;
+            if is_final {
+                self.last_emitted_end[seg.speaker_id] = abs_end;
+                emitted.push(SpeakerSegment {
+                    start: abs_start,
+                    end: abs_end,
+                    speaker_id: seg.speaker_id,
+                });
+            } else {
+                let f = seg.start / spf;
+                pending_start_frame = Some(pending_start_frame.map_or(f, |p| p.min(f)));
+            }
+        }
+        emitted.sort_by_key(|s| (s.start, s.speaker_id));
+
+        if finalize.is_some() {
+            self.base_frame += n_rel;
+            self.preds = Array2::zeros((0, num_speakers));
+        } else {
+            // Trim frames that can no longer matter. Keep enough left context for the median
+            // filter and onset padding, and enough history for activity that has started but
+            // has not yet reached `min_duration_on`.
+            let on_frames = ((config.min_duration_on * SAMPLE_RATE as f32) / spf as f32).ceil() as u64 + 2;
+            let ctx = half + 1 + (pad_on as f32 / spf as f32).ceil() as u64;
+            let safe = pending_start_frame
+                .unwrap_or(u64::MAX)
+                .min(horizon_frame.saturating_sub(on_frames));
+            let cut = safe.saturating_sub(ctx).min(n_rel);
+            if cut > 0 {
+                self.preds = self.preds.slice(s![cut as usize.., ..]).to_owned();
+                self.base_frame += cut;
+            }
+        }
+        emitted
+    }
+}
+
 /// Streaming Sortformer v2 speaker diarization engine
 pub struct Sortformer {
     session: Session,
@@ -268,6 +411,14 @@ pub struct Sortformer {
     pub spkcache_len: usize,
     pub right_context: usize,
     pub num_speakers: usize,
+    // Cache-compression heuristics (optional ONNX metadata, defaults match the 4spk/8spk exports)
+    /// Silence frames reserved per speaker in the compressed speaker cache.
+    spkcache_sil_frames_per_spk: usize,
+    /// Score bonus for frames newer than the current cache during compression (NeMo `scores_boost_latest`).
+    scores_boost_latest: f32,
+    /// Fixed silence embedding stamped by the exporter (`sil_emb` metadata). When present it
+    /// replaces the running-mean silence embedding (NeMo `use_learnable_sil_emb`).
+    learned_sil_emb: Option<Array2<f32>>,
     // Streaming state. note that, Same way as Nemo
     spkcache: Array3<f32>,               // (1, 0..spkcache_len, EMB_DIM)
     spkcache_preds: Option<Array3<f32>>, // (1, 0..spkcache_len, num_speakers)
@@ -276,6 +427,8 @@ pub struct Sortformer {
     mean_sil_emb: Array2<f32>,           // (1, EMB_DIM)
     n_sil_frames: usize,
     // Buffered streaming state (used by feed/flush)
+    stream_post: StreamPost,
+    continuous_feed: bool,
     audio_buffer: Vec<f32>,
     elapsed_samples: usize,
     // Mel filterbank (cached)
@@ -333,6 +486,33 @@ impl Sortformer {
                 DEFAULT_NUM_SPEAKERS,
             ));
 
+        // Optional cache-compression keys; absent keys keep the legacy behaviour.
+        let (spkcache_sil_frames_per_spk, scores_boost_latest, learned_sil_emb) = session
+            .metadata()
+            .map(|m| {
+                let sil_frames = m
+                    .custom("spkcache_sil_frames_per_spk")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(SPKCACHE_SIL_FRAMES_PER_SPK);
+                let boost = m
+                    .custom("scores_boost_latest")
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|b| b.is_finite() && *b >= 0.0)
+                    .unwrap_or(0.0);
+                let sil_emb = m.custom("sil_emb").and_then(|v| {
+                    let vals: Vec<f32> = v
+                        .split(',')
+                        .map(|x| x.trim().parse::<f32>())
+                        .collect::<std::result::Result<_, _>>()
+                        .ok()?;
+                    (vals.len() == EMB_DIM && vals.iter().all(|x| x.is_finite()))
+                        .then(|| Array2::from_shape_vec((1, EMB_DIM), vals).ok())
+                        .flatten()
+                });
+                (sil_frames, boost, sil_emb)
+            })
+            .unwrap_or((SPKCACHE_SIL_FRAMES_PER_SPK, 0.0, None));
+
         let mel_basis = crate::audio::create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE);
 
         let mut instance = Self {
@@ -344,6 +524,9 @@ impl Sortformer {
             spkcache_len,
             right_context,
             num_speakers,
+            spkcache_sil_frames_per_spk,
+            scores_boost_latest,
+            learned_sil_emb,
             spkcache: Array3::zeros((1, 0, EMB_DIM)),
             spkcache_preds: None,
             fifo: Array3::zeros((1, 0, EMB_DIM)),
@@ -353,6 +536,8 @@ impl Sortformer {
             audio_buffer: Vec::new(),
             elapsed_samples: 0,
             mel_basis,
+            stream_post: StreamPost::new(num_speakers),
+            continuous_feed: true,
         };
         instance.reset_state();
         Ok(instance)
@@ -388,8 +573,12 @@ impl Sortformer {
         self.spkcache_preds = None;
         self.fifo = Array3::zeros((1, 0, EMB_DIM));
         self.fifo_preds = Array3::zeros((1, 0, self.num_speakers));
-        self.mean_sil_emb = Array2::zeros((1, EMB_DIM));
+        self.mean_sil_emb = self
+            .learned_sil_emb
+            .clone()
+            .unwrap_or_else(|| Array2::zeros((1, EMB_DIM)));
         self.n_sil_frames = 0;
+        self.stream_post.reset(self.num_speakers);
         self.audio_buffer.clear();
         self.elapsed_samples = 0;
     }
@@ -565,14 +754,88 @@ impl Sortformer {
     ///
     /// # Returns
     /// Speaker segments from any chunks that were ready, or empty vec if still buffering.
+    ///
+    /// # Post-processing
+    /// Predictions from consecutive windows are median-filtered and binarized as one stream
+    /// (identical to offline [`post_process`](Self::post_process)), so segments are not chopped
+    /// at window boundaries and `min_duration_on` is not applied to a single small window. A
+    /// segment is returned once it can no longer change, i.e. a few frames plus
+    /// `min_duration_off` after it ends; `flush` emits whatever is still pending. This holds
+    /// for every export, including low-latency ones where a window is shorter than
+    /// `min_duration_on`. Use [`set_continuous_feed`](Self::set_continuous_feed)`(false)` for the
+    /// legacy per-window behaviour, or [`feed_raw`](Self::feed_raw) to post-process yourself.
     pub fn feed(&mut self, audio_16k_mono: &[f32]) -> Result<Vec<SpeakerSegment>> {
         self.audio_buffer.extend_from_slice(audio_16k_mono);
+        let windows = self.run_ready_windows()?;
+        if self.continuous_feed {
+            let preds: Vec<Array2<f32>> = windows.into_iter().map(|w| w.preds).collect();
+            return Ok(self.stream_post.process(&self.config, &preds, None));
+        }
+        Ok(windows
+            .iter()
+            .flat_map(|w| self.binarize_window(w))
+            .collect())
+    }
 
+    /// Choose how `feed`/`flush` post-process predictions.
+    ///
+    /// `true` (default): continuous post-processing across windows (see [`feed`](Self::feed)).
+    /// `false`: legacy behaviour where each window is median-filtered and thresholded on its
+    /// own and segments are returned immediately. Takes effect on the next `reset_state()` or
+    /// new stream.
+    pub fn set_continuous_feed(&mut self, enabled: bool) {
+        self.continuous_feed = enabled;
+    }
+
+    /// Like [`feed`](Self::feed) but returns the raw per-frame speaker probabilities of every
+    /// window that became ready, with no median filtering or binarization.
+    ///
+    /// Frames are 80 ms each and contiguous across calls (the first returned frame follows the
+    /// last frame of the previous call), so callers can concatenate the results and run
+    /// [`post_process`](Self::post_process) once over the whole stream. Returns an empty
+    /// `[0, num_speakers]` array while still buffering.
+    pub fn feed_raw(&mut self, audio_16k_mono: &[f32]) -> Result<Array2<f32>> {
+        self.audio_buffer.extend_from_slice(audio_16k_mono);
+        let windows = self.run_ready_windows()?;
+        let preds: Vec<Array2<f32>> = windows.into_iter().map(|w| w.preds).collect();
+        Ok(Self::concat_predictions(&preds, self.num_speakers))
+    }
+
+    /// Flush remaining buffered audio at end of stream.
+    ///
+    /// processes any leftover audio in the buffer with zero paddings.
+    /// we call this once when the audio stream ends to get final segments.
+    pub fn flush(&mut self) -> Result<Vec<SpeakerSegment>> {
+        let window = self.run_final_window()?;
+        if self.continuous_feed {
+            let preds: Vec<Array2<f32>> = window.into_iter().map(|w| w.preds).collect();
+            let total = self.elapsed_samples as u64;
+            return Ok(self.stream_post.process(&self.config, &preds, Some(total)));
+        }
+        Ok(match window {
+            Some(w) => self.binarize_window(&w),
+            None => vec![],
+        })
+    }
+
+    /// Raw-probability counterpart of [`flush`](Self::flush): returns the final window's frames
+    /// (continuing from the last [`feed_raw`](Self::feed_raw) frame). Frames beyond the audio
+    /// length can be clipped via the `n_audio_samples` argument of
+    /// [`post_process`](Self::post_process).
+    pub fn flush_raw(&mut self) -> Result<Array2<f32>> {
+        Ok(match self.run_final_window()? {
+            Some(w) => w.preds,
+            None => Array2::zeros((0, self.num_speakers)),
+        })
+    }
+
+    /// Run every full `(chunk_len + right_context)` window currently in the audio buffer.
+    fn run_ready_windows(&mut self) -> Result<Vec<StreamWindow>> {
         let feed_size = (self.chunk_len + self.right_context) * SUBSAMPLING;
         let stride_samples = self.chunk_len * SUBSAMPLING * HOP_LENGTH;
         let feed_samples = (self.chunk_len + self.right_context) * SUBSAMPLING * HOP_LENGTH;
 
-        let mut all_segments = Vec::new();
+        let mut windows = Vec::new();
 
         while self.audio_buffer.len() >= feed_samples {
             let window = &self.audio_buffer[..feed_samples];
@@ -583,40 +846,24 @@ impl Sortformer {
             let current_len = feed_size;
 
             let chunk_preds = self.streaming_update(&chunk_feat, current_len)?;
-
-            // Apply median filtering
-            let filtered_preds = if self.config.median_window > 1 {
-                Self::median_filter(&self.config, &chunk_preds, self.num_speakers)
-            } else {
-                chunk_preds
-            };
-
-            // Binarize with absolute sample offset
-            let sample_offset = self.elapsed_samples as u64;
-            let chunk_samples = (self.chunk_len * SUBSAMPLING * HOP_LENGTH) as u64;
-            let mut segments = Self::binarize(&self.config, &filtered_preds, self.num_speakers);
-            for seg in &mut segments {
-                seg.start += sample_offset;
-                seg.end = (seg.end + sample_offset).min(sample_offset + chunk_samples);
-            }
-            segments.retain(|s| s.end > s.start);
-            all_segments.extend(segments);
+            windows.push(StreamWindow {
+                sample_offset: self.elapsed_samples as u64,
+                span_samples: stride_samples as u64,
+                preds: chunk_preds,
+            });
 
             // Advance: stride by chunk_len, keep right_context overlap
             self.audio_buffer.drain(..stride_samples);
             self.elapsed_samples += stride_samples;
         }
 
-        Ok(all_segments)
+        Ok(windows)
     }
 
-    /// Flush remaining buffered audio at end of stream.
-    ///
-    /// processes any leftover audio in the buffer with zero paddings.
-    /// we call this once when the audio stream ends to get final segments.
-    pub fn flush(&mut self) -> Result<Vec<SpeakerSegment>> {
+    /// Process leftover buffered audio (zero-padded) as the final window.
+    fn run_final_window(&mut self) -> Result<Option<StreamWindow>> {
         if self.audio_buffer.is_empty() {
-            return Ok(vec![]);
+            return Ok(None);
         }
 
         let feed_size = (self.chunk_len + self.right_context) * SUBSAMPLING;
@@ -637,25 +884,29 @@ impl Sortformer {
         };
 
         let chunk_preds = self.streaming_update(&chunk_feat, current_len)?;
-
-        let filtered_preds = if self.config.median_window > 1 {
-            Self::median_filter(&self.config, &chunk_preds, self.num_speakers)
-        } else {
-            chunk_preds
+        let window = StreamWindow {
+            sample_offset: self.elapsed_samples as u64,
+            span_samples: remaining.len() as u64,
+            preds: chunk_preds,
         };
+        self.elapsed_samples += remaining.len();
+        Ok(Some(window))
+    }
 
-        let sample_offset = self.elapsed_samples as u64;
-        let remaining_samples = remaining.len() as u64;
+    /// Median-filter and binarize one streaming window with absolute sample offsets.
+    fn binarize_window(&self, w: &StreamWindow) -> Vec<SpeakerSegment> {
+        let filtered_preds = if self.config.median_window > 1 {
+            Self::median_filter(&self.config, &w.preds, self.num_speakers)
+        } else {
+            w.preds.clone()
+        };
         let mut segments = Self::binarize(&self.config, &filtered_preds, self.num_speakers);
         for seg in &mut segments {
-            seg.start += sample_offset;
-            seg.end = (seg.end + sample_offset).min(sample_offset + remaining_samples);
+            seg.start += w.sample_offset;
+            seg.end = (seg.end + w.sample_offset).min(w.sample_offset + w.span_samples);
         }
         segments.retain(|s| s.end > s.start);
-
-        self.elapsed_samples += remaining.len();
-
-        Ok(segments)
+        segments
     }
 
     /// run streaming inference over mel features, returning concatenated per chunk predictions.
@@ -861,6 +1112,9 @@ impl Sortformer {
 
     /// Update mean silence embedding
     fn update_silence_profile(&mut self, embs: &Array3<f32>, preds: &Array3<f32>) {
+        if self.learned_sil_emb.is_some() {
+            return; // fixed, exporter-provided silence embedding
+        }
         let preds_2d = preds.slice(s![0, .., ..]);
 
         for t in 0..preds_2d.shape()[0] {
@@ -895,7 +1149,8 @@ impl Sortformer {
 
         let n_frames = self.spkcache.shape()[1];
         let per_spk = self.spkcache_len / self.num_speakers;
-        if per_spk <= SPKCACHE_SIL_FRAMES_PER_SPK {
+        let sil_frames = self.spkcache_sil_frames_per_spk;
+        if per_spk <= sil_frames {
             // truncate if cache too small for compression
             self.spkcache = self.spkcache.slice(s![.., ..self.spkcache_len, ..]).to_owned();
             if let Some(ref p) = self.spkcache_preds {
@@ -903,7 +1158,7 @@ impl Sortformer {
             }
             return;
         }
-        let spkcache_len_per_spk = per_spk - SPKCACHE_SIL_FRAMES_PER_SPK;
+        let spkcache_len_per_spk = per_spk - sil_frames;
         let strong_boost_per_spk = (spkcache_len_per_spk as f32 * STRONG_BOOST_RATE) as usize;
         let weak_boost_per_spk = (spkcache_len_per_spk as f32 * WEAK_BOOST_RATE) as usize;
         let min_pos_scores_per_spk = (spkcache_len_per_spk as f32 * MIN_POS_SCORES_RATE) as usize;
@@ -915,18 +1170,27 @@ impl Sortformer {
         // Disable low scores
         scores = self.disable_low_scores(&preds_2d, scores, min_pos_scores_per_spk);
 
+        // Boost frames newer than the current cache capacity (NeMo `scores_boost_latest`)
+        if self.scores_boost_latest > 0.0 {
+            for t in self.spkcache_len..n_frames {
+                for s in 0..self.num_speakers {
+                    scores[[t, s]] += self.scores_boost_latest;
+                }
+            }
+        }
+
         // Boost important frames
         scores = self.boost_topk_scores(scores, strong_boost_per_spk, 2.0);
         scores = self.boost_topk_scores(scores, weak_boost_per_spk, 1.0);
 
         // Add silence frames placeholder
-        if SPKCACHE_SIL_FRAMES_PER_SPK > 0 {
+        if sil_frames > 0 {
             let mut padded = Array2::from_elem(
-                (n_frames + SPKCACHE_SIL_FRAMES_PER_SPK, self.num_speakers),
+                (n_frames + sil_frames, self.num_speakers),
                 f32::NEG_INFINITY,
             );
             padded.slice_mut(s![..n_frames, ..]).assign(&scores);
-            for i in n_frames..n_frames + SPKCACHE_SIL_FRAMES_PER_SPK {
+            for i in n_frames..n_frames + sil_frames {
                 for j in 0..self.num_speakers {
                     padded[[i, j]] = f32::INFINITY;
                 }
@@ -1405,5 +1669,64 @@ mod tests {
         let freq_bins = N_FFT / 2 + 1;
         assert_eq!(spec.shape()[0], freq_bins);
         assert!(spec.shape()[1] > 0);
+    }
+
+    /// Deterministic synthetic probabilities: bursts of activity per speaker with short gaps,
+    /// overlaps, and a burst too short for `min_duration_on`.
+    fn synthetic_preds(frames: usize, num_speakers: usize) -> Array2<f32> {
+        let mut p = Array2::from_elem((frames, num_speakers), 0.02f32);
+        let bursts: &[(usize, usize, usize)] = &[
+            (5, 40, 0), (44, 90, 0), (60, 130, 1), (120, 124, 2), (150, 151, 1),
+            (200, 330, 2), (210, 215, 0), (240, 260, 0), (262, 300, 0), (400, 590, 1),
+            (410, 430, 2), (560, 600, 0),
+        ];
+        for &(a, b, spk) in bursts {
+            for t in a..b.min(frames) {
+                // ramp edges to exercise the median filter
+                let edge = (t - a).min(b - t).min(3) as f32 / 3.0;
+                p[[t, spk]] = 0.2 + 0.75 * edge;
+            }
+        }
+        p
+    }
+
+    fn key(v: &[SpeakerSegment]) -> Vec<(usize, u64, u64)> {
+        let mut k: Vec<_> = v.iter().map(|s| (s.speaker_id, s.start, s.end)).collect();
+        k.sort();
+        k
+    }
+
+    #[test]
+    fn continuous_stream_matches_offline_post_process() {
+        let frames = 610;
+        let preds = synthetic_preds(frames, 3);
+        let total = frames as u64 * 1280 - 500; // audio ends mid-frame
+        for config in [DiarizationConfig::callhome(), DiarizationConfig::nemotron3()] {
+            let offline = Sortformer::post_process(&config, &preds, total);
+            assert!(offline.len() >= 6, "synthetic stream should yield several segments");
+            for step in [1usize, 3, 9, 340] {
+                let mut sp = StreamPost::new(3);
+                let mut got = Vec::new();
+                let mut t = 0;
+                while t < frames {
+                    let e = (t + step).min(frames);
+                    got.extend(sp.process(&config, &[preds.slice(s![t..e, ..]).to_owned()], None));
+                    t = e;
+                }
+                got.extend(sp.process(&config, &[], Some(total)));
+                assert_eq!(key(&got), key(&offline), "step={step} median={}", config.median_window);
+            }
+        }
+    }
+
+    #[test]
+    fn continuous_stream_buffer_stays_bounded() {
+        let config = DiarizationConfig::callhome();
+        let mut sp = StreamPost::new(2);
+        let silence = Array2::from_elem((3, 2), 0.01f32);
+        for _ in 0..2000 {
+            sp.process(&config, &[silence.clone()], None);
+        }
+        assert!(sp.preds.nrows() < 40, "buffer grew to {}", sp.preds.nrows());
     }
 }

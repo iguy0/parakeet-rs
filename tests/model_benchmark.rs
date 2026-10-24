@@ -484,7 +484,7 @@ num_ref_speakers,num_hyp_speakers,der,missed,false_alarm,confusion,jer";
         let mut sf = Sortformer::with_config(
             sortformer_onnx(),
             Some(execution_config()),
-            DiarizationConfig::callhome(),
+            diar_config(),
         )
                 .expect("load sortformer");
 
@@ -554,6 +554,246 @@ num_ref_speakers,num_hyp_speakers,der,missed,false_alarm,confusion,jer";
         der * 100.0,
         ceiling * 100.0
     );
+}
+
+/// Sweep post-processing thresholds over raw predictions (the model runs once per clip, then
+/// every candidate `DiarizationConfig` is scored on the cached probabilities). Ignored by
+/// default; run with `-- --ignored --nocapture`. Candidates are ranked by mean DER over the
+/// clips named in `PARAKEET_SWEEP_TUNE` (default: the two long meeting clips); the remaining
+/// clips are reported as hold-out. Only a few clips exist, so treat the winner as a starting
+/// point to confirm on your own audio, not a universal optimum.
+#[cfg(feature = "sortformer")]
+#[test]
+#[ignore = "threshold sweep; run explicitly with --ignored"]
+fn diarization_threshold_sweep() {
+    use parakeet_rs::sortformer::{DiarizationConfig, Sortformer};
+
+    if !sortformer_available() {
+        skip("diarization_threshold_sweep", "sortformer model not found");
+        return;
+    }
+    let tune: Vec<String> = std::env::var("PARAKEET_SWEEP_TUNE")
+        .unwrap_or_else(|_| "committee,datascience-staff-meeting".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+
+    // Raw predictions + reference per clip (one model pass each).
+    struct Clip {
+        name: String,
+        preds: ndarray::Array2<f32>,
+        n_samples: u64,
+        reference: Vec<DiarSegment>,
+        secs: f32,
+    }
+    let mut clips = Vec::new();
+    for sample in discover_samples() {
+        let (audio, sr) = load_wav_mono_16k(&sample.wav);
+        let secs = audio.len() as f32 / 16_000.0;
+        let mut sf = Sortformer::with_config(
+            sortformer_onnx(),
+            Some(execution_config()),
+            DiarizationConfig::callhome(),
+        )
+        .expect("load sortformer");
+        let (preds, n_samples) = sf.predict_raw(audio, sr, 1).expect("predict_raw");
+        let raw_ref = std::fs::read_to_string(&sample.transcript).expect("read transcript");
+        clips.push(Clip {
+            name: sample.name.clone(),
+            preds,
+            n_samples,
+            reference: parse_reference_turns(&raw_ref, secs),
+            secs,
+        });
+    }
+
+    let score = |cfg: &DiarizationConfig, c: &Clip| -> f32 {
+        let hyp: Vec<DiarSegment> = Sortformer::post_process(cfg, &c.preds, c.n_samples)
+            .iter()
+            .map(|s| DiarSegment {
+                speaker: s.speaker_id,
+                start: s.start as f32 / 16_000.0,
+                end: s.end as f32 / 16_000.0,
+            })
+            .collect();
+        diarization_metrics(&c.reference, &hyp, c.secs).der
+    };
+
+    let onsets = [0.35f32, 0.40, 0.45, 0.50, 0.55, 0.60, 0.641];
+    let offset_gaps = [0.0f32, 0.05, 0.10, 0.20];
+    let min_ons = [0.10f32, 0.20, 0.30, 0.511];
+    let pads = [(0.229f32, 0.079f32), (0.10, 0.05)];
+    let medians = [7usize, 11];
+
+    let mut results: Vec<(f32, DiarizationConfig, Vec<f32>)> = Vec::new();
+    let mut candidates: Vec<DiarizationConfig> = Vec::new();
+    for &on in &onsets {
+        for &gap in &offset_gaps {
+            for &mon in &min_ons {
+                for &(pon, poff) in &pads {
+                    for &med in &medians {
+                        candidates.push(DiarizationConfig {
+                            onset: on,
+                            offset: (on - gap).max(0.05),
+                            pad_onset: pon,
+                            pad_offset: poff,
+                            min_duration_on: mon,
+                            min_duration_off: 0.296,
+                            median_window: med,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    candidates.push(DiarizationConfig::callhome());
+    for cfg in candidates {
+        let ders: Vec<f32> = clips.iter().map(|c| score(&cfg, c)).collect();
+        let tuned: Vec<f32> = clips
+            .iter()
+            .zip(&ders)
+            .filter(|(c, _)| tune.contains(&c.name))
+            .map(|(_, d)| *d)
+            .collect();
+        let mean = tuned.iter().sum::<f32>() / tuned.len().max(1) as f32;
+        results.push((mean, cfg, ders));
+    }
+    results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let names: Vec<&str> = clips.iter().map(|c| c.name.as_str()).collect();
+    eprintln!("\nclips: {names:?}  (tuned on {tune:?})");
+    eprintln!("{:<8} {:<7} {:<7} {:<7} {:<7} {:<7} {:<5} per-clip DER %", "tunedDER", "onset", "offset", "min_on", "pad_on", "pad_off", "med");
+    let fmt = |r: &(f32, DiarizationConfig, Vec<f32>)| {
+        let c = &r.1;
+        let per: Vec<String> = r.2.iter().map(|d| format!("{:.1}", d * 100.0)).collect();
+        eprintln!(
+            "{:<8.2} {:<7.3} {:<7.3} {:<7.3} {:<7.3} {:<7.3} {:<5} {}",
+            r.0 * 100.0, c.onset, c.offset, c.min_duration_on, c.pad_onset, c.pad_offset,
+            c.median_window, per.join(" / ")
+        );
+    };
+    eprintln!("-- top 12");
+    for r in results.iter().take(12) {
+        fmt(r);
+    }
+    eprintln!("-- callhome baseline");
+    if let Some(r) = results.iter().find(|r| {
+        let c = &r.1;
+        c.onset == 0.641 && c.offset == 0.561 && c.min_duration_on == 0.511 && c.median_window == 11
+    }) {
+        fmt(r);
+    }
+}
+
+/// Score the buffered streaming API (`feed` / `flush`) for DER, with audio delivered in
+/// 1 s increments. Two routes are reported per clip:
+///   - `feed`: segments exactly as the API returns them (median filter + thresholds applied
+///     independently inside each window, the way a live consumer sees them);
+///   - `feed_raw`: raw per-frame probabilities from the same streaming state, concatenated and
+///     post-processed once over the whole stream. This isolates model + speaker-cache quality
+///     from per-window post-processing artifacts.
+/// Appends to `samples/diarization_streaming_report.csv`. Restrict routes with
+/// PARAKEET_STREAM_ROUTES (`feed`, `feed_raw`) and clips with
+/// PARAKEET_BENCH_SAMPLES; the latency preset is whichever ONNX PARAKEET_SORTFORMER_ONNX names.
+#[cfg(feature = "sortformer")]
+#[test]
+fn sortformer_streaming_der_report() {
+    use parakeet_rs::sortformer::Sortformer;
+    use std::time::Instant;
+
+    if !sortformer_available() {
+        skip("sortformer_streaming_der_report", "sortformer model not found");
+        return;
+    }
+    if ep_skip_if_unavailable("sortformer_streaming_der_report") {
+        return;
+    }
+    let model_name = sortformer_onnx()
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("sortformer")
+        .to_string();
+    let label = bench_label();
+    let rid = run_id();
+    let header = "run_id,label,sample,model,route,audio_secs,proc_secs,rtf,\
+num_ref_speakers,num_hyp_speakers,der,missed,false_alarm,confusion,jer";
+
+    eprintln!("\nStreaming DER ({model_name}, 1 s input increments):");
+    eprintln!("{:<28} {:<9} {:>6} {:>6} {:>6} {:>6} {:>6}", "sample", "route", "RTF", "DER", "miss", "FA", "JER");
+    eprintln!("{}", "-".repeat(76));
+
+    for sample in discover_samples() {
+        let (audio, _) = load_wav_mono_16k(&sample.wav);
+        let audio_secs = audio.len() as f32 / 16_000.0;
+        let raw_ref = std::fs::read_to_string(&sample.transcript).expect("read transcript");
+        let reference = parse_reference_turns(&raw_ref, audio_secs);
+
+        let mut sf = Sortformer::with_config(
+            sortformer_onnx(),
+            Some(execution_config()),
+            diar_config(),
+        )
+        .expect("load sortformer");
+
+        let routes = std::env::var("PARAKEET_STREAM_ROUTES").unwrap_or_else(|_| "feed,feed_raw".into());
+        for route in ["feed", "feed_raw"] {
+            if !routes.split(',').any(|r| r.trim() == route) {
+                continue;
+            }
+            sf.reset_state();
+            let t0 = Instant::now();
+            let hyp_segments = if route == "feed" {
+                let mut segs = Vec::new();
+                for c in audio.chunks(16_000) {
+                    segs.extend(sf.feed(c).expect("feed"));
+                }
+                segs.extend(sf.flush().expect("flush"));
+                segs
+            } else {
+                let mut parts = Vec::new();
+                for c in audio.chunks(16_000) {
+                    let p = sf.feed_raw(c).expect("feed_raw");
+                    if p.nrows() > 0 {
+                        parts.push(p);
+                    }
+                }
+                let tail = sf.flush_raw().expect("flush_raw");
+                if tail.nrows() > 0 {
+                    parts.push(tail);
+                }
+                let views: Vec<_> = parts.iter().map(|p| p.view()).collect();
+                let all = ndarray::concatenate(ndarray::Axis(0), &views).expect("concat");
+                Sortformer::post_process(&diar_config(), &all, audio.len() as u64)
+            };
+            let proc_secs = t0.elapsed().as_secs_f32();
+            let rtf = if proc_secs > 0.0 { audio_secs / proc_secs } else { 0.0 };
+
+            let hyp: Vec<DiarSegment> = hyp_segments
+                .iter()
+                .map(|s| DiarSegment {
+                    speaker: s.speaker_id,
+                    start: s.start as f32 / 16_000.0,
+                    end: s.end as f32 / 16_000.0,
+                })
+                .collect();
+            let m = diarization_metrics(&reference, &hyp, audio_secs);
+            eprintln!(
+                "{:<28} {:<9} {:>5.1}x {:>5.1}% {:>5.1}% {:>5.1}% {:>5.1}%",
+                sample.name, route, rtf, m.der * 100.0, m.missed * 100.0,
+                m.false_alarm * 100.0, m.jer * 100.0
+            );
+            append_csv_row(
+                "diarization_streaming_report.csv",
+                header,
+                &format!(
+                    "{rid},{label},{},{model_name},{route},{audio_secs:.2},{proc_secs:.3},{rtf:.2},\
+{},{},{:.4},{:.4},{:.4},{:.4},{:.4}",
+                    sample.name, m.num_ref_speakers, m.num_hyp_speakers, m.der, m.missed,
+                    m.false_alarm, m.confusion, m.jer
+                ),
+            );
+        }
+    }
 }
 
 /// Exercise Sortformer's streaming API (`diarize_chunk` + `flush`) to ensure the

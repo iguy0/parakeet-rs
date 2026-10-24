@@ -69,7 +69,10 @@ git push-fork        # push current branch to origin (iguy0)
 | `src/nemotron.rs` | Modified | 560 ms chunk config comment + beam decoding hook |
 | `scripts/quantize_nemotron_streaming.py` | Untracked | Local INT8/INT4 quantization tooling (candidate for upstream) |
 | `scripts/export_ultra_diar_8spk.py` | Untracked | 8-speaker Sortformer export |
-| `src/sortformer.rs` | Modified | Metadata-driven `num_speakers` (default 4); enables 8spk ONNX; `SessionRouter` trait + `set_session_router`; `diarize()` split into `predict_raw()` + `post_process()` |
+| `scripts/export_nemotron3_diarization.py` | Added | `nvidia/Nemotron-3-Diarization` export (31-layer RoPE transformer, 8 spk, 99.2M params). Same 6-in/3-out ONNX contract as the other Sortformer exports; presets `offline`/`low`/`verylow`/`ultralow`; swaps NeMo FlexAttention for dense-mask SDPA at export time; stamps cache-compression metadata; optional `--int8-output` + `--compare-wav` |
+| `src/sortformer.rs` (metadata) | Modified | `num_speakers` (default 4), plus optional `spkcache_sil_frames_per_spk` (default 3), `scores_boost_latest` (default 0), `sil_emb` (fixed silence embedding replacing the running mean). Absent keys keep legacy behaviour |
+| `src/sortformer.rs` (API) | Modified | `SessionRouter` + `set_session_router`; `diarize()` = `predict_raw()` + `post_process()`; `feed_raw`/`flush_raw` (raw 80 ms probabilities); `feed`/`flush` post-process continuously across windows via private `StreamPost` (`set_continuous_feed(false)` = legacy per-window); `DiarizationConfig::nemotron3()` preset |
+| `tests/common/mod.rs`, `tests/model_benchmark.rs` (diarization) | Modified | Env knobs `PARAKEET_DIAR_PRESET`, `PARAKEET_BENCH_SAMPLES`, `PARAKEET_STREAM_ROUTES`; tests `sortformer_streaming_der_report` and `diarization_threshold_sweep` (`--ignored`). See section 4 Testing |
 | `src/config.rs` | Modified | `CtcConfig`/`CtcFrontendConfig`/`NormalizationMode` — metadata-driven CTC blank-id/token-offset/frontend (deltas, frame stacking, db-floor normalization, encoder subsample), read from ONNX `metadata_props` with Parakeet-CTC-0.6b defaults when absent |
 | `scripts/patch_ctc_onnx_metadata.py` | Added | Stamps `ctc_*` metadata keys onto third-party CTC ONNX graphs (e.g. Granite TurboCTC) so `CtcConfig::from_metadata` picks them up |
 | `src/model.rs` | Modified | Reads `CtcConfig` from session metadata at load time via `ctc_config_from_session` |
@@ -153,10 +156,14 @@ Optional Cargo features gate heavier modules: `sortformer`, `multitalker` (impli
 | Feature | Public API | Core Logic | Entry Points |
 |---------|------------|------------|--------------|
 | **Sortformer v2/v2.1 (4 speakers)** | `sortformer::Sortformer` *(feature `sortformer`)* | `src/sortformer.rs` | `diarize()` (= `predict_raw()` + `post_process()`), `diarize_chunk()` |
+| **Ultra Sortformer 8spk** | Same type; `num_speakers` read from ONNX metadata | `src/sortformer.rs`, `scripts/export_ultra_diar_8spk.py` | Same entry points; start post-processing from `DiarizationConfig::ultra_8spk()` |
+| **Nemotron-3-Diarization (8 spk, 31-layer RoPE transformer)** | Same type, no new code path: exported with the identical ONNX contract | `scripts/export_nemotron3_diarization.py`, metadata reads in `Sortformer::with_config` | Same entry points; start post-processing from `DiarizationConfig::nemotron3()` (or `callhome()`) |
 | **Sortformer + TDT combined** | Example composition | `examples/diarization.rs` | Offline full-file |
-| **Streaming diarization** | `Sortformer::diarize_chunk` | `src/sortformer.rs` | `examples/streaming_diarization.rs` |
+| **Streaming diarization** | `Sortformer::feed` / `flush` (absolute timestamps), `feed_raw` / `flush_raw` (raw 80 ms probabilities) | `src/sortformer.rs` (`StreamPost`, `run_ready_windows`, `run_final_window`) | `examples/streaming_diarization.rs` |
 
-Post-processing: `DiarizationConfig` presets (`callhome()`, `dihard3()`, `custom()`).
+`diarize_chunk()` keeps FIFO/cache state across calls but returns timestamps relative to each call and post-processes each call separately; use `feed`/`flush` for live audio with absolute times.
+
+Post-processing: `DiarizationConfig` presets (`callhome()`, `dihard3()`, `ultra_8spk()`, `nemotron3()`, `for_num_speakers()`, `custom()`). `for_num_speakers` picks `ultra_8spk` above 4 speakers and does not know about `nemotron3()`.
 
 ### Streaming vs Batch/Chunk Summary
 
@@ -168,7 +175,7 @@ Post-processing: `DiarizationConfig` presets (`callhome()`, `dihard3()`, `custom
 | Cohere Transcribe | Batch/offline only | `transcribe_audio` one-shot; caller chunks long-form audio manually, no persisted cache |
 | Ark ASR | Batch/offline only | Fixed-length static KV cache sized by model manifest; no chunk/streaming API |
 | EOU, Nemotron, Multitalker | Streaming only | `*Handle` + chunk method; see Streaming ASR table above |
-| Sortformer | Both | `diarize()` = offline full-file; `diarize_chunk()` = streaming with persisted FIFO/cache |
+| Sortformer (4spk, 8spk, Nemotron-3) | Both | `diarize()` = offline full-file; `feed()`/`flush()` = buffered streaming with persisted FIFO/cache and continuous cross-window post-processing; `diarize_chunk()` = stateful but per-call relative timestamps |
 | Unified (RNNT) | Both (hybrid, same struct) | `transcribe_audio`/`transcribe_file` (offline) vs `transcribe_chunk` + `flush` (buffered streaming per `UnifiedStreamingConfig`); `reset()` clears streaming state |
 
 ### Cross-Cutting Infrastructure
@@ -196,6 +203,7 @@ Post-processing: `DiarizationConfig` presets (`callhome()`, `dihard3()`, `custom
 | `scripts/export_multitalker.py` | Multitalker encoder/decoder export | `multitalker.rs` |
 | `scripts/export_diar_sortformer.py` | Sortformer 4spk with tunable chunk/FIFO/cache params | `sortformer.rs` constants (overridable via ONNX metadata) |
 | `scripts/export_ultra_diar_8spk.py` | 8-speaker Sortformer export | `sortformer.rs` reads `num_speakers` from ONNX metadata |
+| `scripts/export_nemotron3_diarization.py` | Nemotron-3-Diarization export (+ optional INT8) | `sortformer.rs` reads `sil_emb`, `scores_boost_latest`, `spkcache_sil_frames_per_spk` from ONNX metadata |
 | `scripts/benchmark/run_all.sh` | Greedy-vs-beam example harness (env-driven model/clip selection) | Drives `examples/*` with `--decoding greedy|beam` |
 | `scripts/benchmark/compare_greedy_beam.py` | Transcript edit-distance / optional WER diff for greedy vs beam | Consumed by `run_all.sh` |
 | `scripts/patch_ctc_onnx_metadata.py` | Stamps `ctc_*` `metadata_props` (blank id, token offset, frontend deltas/stacking/normalization, encoder subsample) onto third-party single-file CTC ONNX graphs | `config.rs` `CtcConfig::from_metadata`, `model.rs` `ctc_config_from_session` |
@@ -233,10 +241,11 @@ flowchart LR
 
 ### Life of Diarization
 
-1. `Sortformer::with_config` loads ONNX, reads optional metadata for chunk/FIFO lengths.
-2. Full-file: `diarize` iterates ~10 s chunks with FIFO + speaker cache compression.
-3. Streaming: `diarize_chunk` preserves internal FIFO/cache across calls.
-4. Raw frame probabilities → median filter → hysteresis → `SpeakerSegment { speaker_id, start, end }`.
+1. `Sortformer::with_config` loads ONNX and reads `metadata_props`: `chunk_len`, `fifo_len`, `spkcache_len`, `right_context`, `num_speakers`, and the optional `spkcache_sil_frames_per_spk`, `scores_boost_latest`, `sil_emb`. Missing keys fall back to the legacy 4spk defaults.
+2. Mel features (128 mel, 10 ms hop) feed windows of `chunk_len + right_context` 80 ms frames. Each `streaming_update` runs the ONNX graph on `[spkcache | fifo | chunk]`, keeps `chunk_len` predictions, pushes the chunk's `pre_encode` embeddings into the FIFO, and moves overflow into the speaker cache (`compress_spkcache`: score, boost, top-k per speaker, silence-embedding padding).
+3. Offline: `diarize` = `predict_raw` (all windows) then `post_process`.
+4. Streaming: `feed` appends audio, runs every ready window, and passes the raw frames to `StreamPost`, which re-runs median filter + hysteresis over a rolling buffer and emits only segments that can no longer change; `flush` finalizes the rest. `feed_raw`/`flush_raw` return the raw frames instead.
+5. Post-processing: median filter, hysteresis binarize with onset/offset and padding, `min_duration_on`/`min_duration_off` merge, giving `SpeakerSegment { speaker_id, start, end }` in samples at 16 kHz.
 
 ### External Integrations
 
@@ -258,6 +267,8 @@ flowchart LR
 - **Nemotron latency is export-time locked:** Changing `--right-context` in export requires updating `CHUNK_SIZE` in `src/nemotron.rs` (see table in `export_nemotron_streaming.py` header).
 - **Mel/STFT must match training:** Custom STFT in Rust (librosa-inspired for Sortformer); do not swap for naive DFT.
 - **CTC config is metadata-driven, not `config.json`-driven:** `CtcConfig` (blank id, token offset, frontend deltas/stacking/normalization, encoder subsample) is read from ONNX `metadata_props` at session-load time (`model.rs` `ctc_config_from_session`), falling back to Parakeet-CTC-0.6b defaults when absent. Third-party graphs (e.g. Granite TurboCTC) need `scripts/patch_ctc_onnx_metadata.py` run once to stamp the keys; `ModelConfigJson`/`PreprocessorConfig` in `config.rs` still assume Parakeet-CTC-0.6b shapes and are not read from `config.json` at runtime.
+- **Sortformer streaming preset is stamped at export, not hardcoded:** `chunk_len`/`right_context`/`fifo_len`/`spkcache_len` come from ONNX metadata. For Nemotron-3 pick `--preset offline|low|verylow|ultralow` in `export_nemotron3_diarization.py` (latency = `(chunk_len + right_context) * 80 ms`; `spkcache_len` stays 264).
+- **Nemotron-3 export needs NeMo Speech `main`:** neither `nemo-toolkit` 2.7.3 nor the 3.0.0 PyPI release can restore the checkpoint (RoPE `TransformerEncoder`, `learnable_sil_emb`, high-resolution head). Point `PYTHONPATH` at a checkout (plus `lhotse==2.0.0a6`) instead of upgrading the environment. The NeMo encoder uses FlexAttention, which cannot be traced; the script swaps in a dense padding mask + `scaled_dot_product_attention`, valid only for `attn_mode="full"` with `causal_tail_len=0` (the script prints both).
 - **`ArkAsr` (feature `ark-asr`) is a fixed-length KV cache:** `max_total_len` comes from the loaded model's manifest; `prompt_len + max_new_tokens` must not exceed it or `decode_greedy` errors. No beam search, streaming, or `TimestampMode` support.
 
 ### Known Gotchas
@@ -272,6 +283,12 @@ flowchart LR
 | **Sortformer + multitalker** | Multitalker depends on Sortformer raw predictions for speaker masks |
 | **Threading** | Streaming handles use `Arc<Mutex<...>>` for ONNX sessions — avoid hot-path lock contention in multi-stream servers |
 | **Sortformer `SessionRouter`** | Optional trait to swap sessions per streaming window shape; must stay `Send + Sync` (enforced by `tests/auto_traits.rs`) since it lives behind `Sortformer`'s own auto-trait bounds |
+| **Nemotron-3 vs Sortformer metadata** | Without `sil_emb`/`scores_boost_latest`/`spkcache_sil_frames_per_spk` the same graph scored 30.9% DER vs 19.3% on the 11-speaker clip: always export with `export_nemotron3_diarization.py`, never strip the metadata |
+| **`feed()` finalization delay** | Segments are returned once final (a few frames + `min_duration_off` after they end), not immediately. A long monologue keeps its segment pending, so `StreamPost`'s buffer grows with it. Legacy per-window output: `set_continuous_feed(false)` (breaks below `min_duration_on`-sized windows) |
+| **`nemotron3()` preset** | Tuned on two clips only (about 0.7 DER points over `callhome()`); `callhome()` remains a sound default. Nemotron-3's higher missed-speech rate on many-speaker audio is not a threshold problem |
+| **Nemotron-3 INT8 on CUDA** | The CUDA EP needs cuDNN on `LD_LIBRARY_PATH` (e.g. the conda env's `nvidia/cudnn/lib`), and dynamic-INT8 ops fall back to CPU, so the GPU gave only about 1.3x vs 1.0x on the 0.32 s preset. fp32 on CUDA is untested |
+| **Low-latency CPU cost** | Each step reprocesses `spkcache + fifo + chunk` (about 530 frames); INT8 on CPU runs about 1.0x real time at 1.04 s, 0.7x at 0.64 s, 0.4x at 0.32 s |
+| **Stray files** | `scripts/test_write.txt` (scratch, contains `ok`) and `scripts/__pycache__/` are not part of the project and must not be committed |
 | **`ModelConfig::configure` closures** | Must be `Send + Sync + 'static` (wrapped in `Arc`) now that `ModelConfig` itself is `Send + Sync` — custom `SessionBuilder` closures capturing non-`Sync` state will fail to compile |
 
 ### Linting / Style
@@ -287,6 +304,22 @@ flowchart LR
 - Run: `cargo test --release --test model_benchmark --features "sortformer multitalker cohere" -- --nocapture`. Set `PARAKEET_BENCH_ALL=1` to include the long (~10–29 min) clips.
 - **Greedy-vs-beam harness:** `scripts/benchmark/run_all.sh` (config in `manifest.toml`) drives the examples in both decodings and diffs transcripts via `compare_greedy_beam.py`; all model dirs/clips are env-overridable and skip gracefully.
 - **Auto-trait tests:** `tests/auto_traits.rs` asserts `Sortformer: Send + Sync` at compile time (gated on feature `sortformer`); extend similarly if new public types pick up `Arc<dyn Fn>`/session-router style fields.
+- **Diarization benchmark knobs** (all optional, defaults unchanged): `PARAKEET_SORTFORMER_ONNX` (model path; default 4spk v2.1), `PARAKEET_DIAR_PRESET` (`callhome` | `dihard3` | `ultra8` | `nemotron3`), `PARAKEET_BENCH_SAMPLES` (comma list of `samples/` names, e.g. `smoke,committee`), `PARAKEET_STREAM_ROUTES` (`feed`, `feed_raw`), `PARAKEET_BENCH_LABEL` (tag in the CSV), `PARAKEET_EP` (`cpu`, or `cuda` when built with feature `cuda`).
+- **Diarization tests:** `diarization_benchmark_report` (offline DER, `samples/diarization_report.csv`); `sortformer_streaming_der_report` (1 s input increments through `feed`/`flush` and `feed_raw` + one `post_process`, `samples/diarization_streaming_report.csv`); `sortformer_streaming_smoke` (`diarize_chunk` + `flush`); `diarization_threshold_sweep` (`-- --ignored`, scores about 450 `DiarizationConfig`s on cached raw predictions, ranks by the clips in `PARAKEET_SWEEP_TUNE`). Unit tests in `src/sortformer.rs` check that `StreamPost` equals offline `post_process` for 1/3/9/340-frame steps and that its buffer stays bounded.
+- **Slow configs:** low-latency Sortformer presets run near or below real time on CPU; restrict clips with `PARAKEET_BENCH_SAMPLES` and never launch several benchmark processes at once (they contend for CPU and make RTF meaningless).
+- **Reference diarization results** (DER %, CPU, `samples/`: committee 6 spk, datascience 11 spk, smoke 2 spk; only 3 clips, not comparable with published numbers):
+
+| Model / setting | committee | datascience | smoke |
+|-----------------|-----------|-------------|-------|
+| 4spk v2.1, `callhome` | 21.3 | 30.9 | 12.7 |
+| 8spk ultra, `ultra8` | 13.1 | 15.7 | 13.1 |
+| Nemotron-3 INT8 offline, `callhome` | 11.5 | 19.1 | 12.3 |
+| Nemotron-3 INT8 offline, `nemotron3` | 11.0 | 18.3 | 12.7 |
+| Nemotron-3 INT8, `feed()` offline window, `nemotron3` | 10.9 | 18.1 | 12.7 |
+| Nemotron-3 INT8, `feed()` 1.04 s window, `nemotron3` | 12.0 | not run | 12.7 |
+| Nemotron-3 INT8, `feed()` 0.32 s window, `nemotron3` | not run | not run | 12.7 |
+
+  Nemotron-3 fp32 and INT8 agree within 0.2 points; the older 8spk model is better on the 11-speaker clip.
 - Validation is otherwise manual via `examples/` with downloaded ONNX weights (including `examples/ark_asr.rs`, feature `ark-asr`).
 
 ---
@@ -302,6 +335,11 @@ flowchart LR
 | Medium | Model-backed WER/DER benchmark suite | **Done locally** — `tests/model_benchmark.rs` (real-weight, weight-gated). Remaining: tiny fixture ONNX graphs for weight-free CI |
 | Medium | Load CTC configs from metadata instead of hardcoding | **Done locally** — `config.rs` `CtcConfig::from_metadata` + `scripts/patch_ctc_onnx_metadata.py`. Remaining: same treatment for TDT (`model_tdt.rs` still assumes fixed vocab/shape); `ModelConfigJson`/`PreprocessorConfig` still not read from `config.json` at runtime |
 | Medium | WebGPU EP validation (Linux dev → Windows 11 D3D12 certification) | **In progress** — `plans/WEBGPU_IMPLEMENTATION_PLAN.md`; Nemotron still blocked on `ort` rc.12/rc.13 Vulkan Slice validation |
+| High | Nemotron-3-Diarization support (export, INT8, metadata-driven cache compression, streaming) | **Done locally** — `scripts/export_nemotron3_diarization.py`, `sortformer.rs`. Remaining: upstream as small PRs (export script; optional metadata keys; `StreamPost`, noting that `feed()` output now arrives after finalization), and run the low-latency presets on the 11-speaker clip |
+| Medium | Benchmark Nemotron-3 fp32 on CUDA (INT8 falls back to CPU, so low-latency presets are about real-time or slower on CPU) | `tests/model_benchmark.rs` with `PARAKEET_EP=cuda` + cuDNN on `LD_LIBRARY_PATH` |
+| Medium | Make `DiarizationConfig::for_num_speakers` / presets model-aware (e.g. stamp a preferred preset name into ONNX metadata) so `Sortformer::new` is tuned per export without caller knowledge | `sortformer.rs`, export scripts |
+| Medium | Bound `StreamPost` memory for very long single-speaker segments (emit open segments incrementally) | `sortformer.rs` |
+| Low | Investigate Nemotron-3 missed speech on many-speaker audio (not threshold-driven) | export/model side |
 | Low | CoreML graph rewriting for static shapes | `execution.rs` |
 | Low | Batch transcription API (currently sequential in `transcriber.rs`) | `Transcriber` trait |
 | Low | Beam search / streaming support for `ArkAsr` | `src/ark_asr.rs` (currently greedy-only, fixed KV cache) |
@@ -323,7 +361,7 @@ parakeet-rs/
 │   ├── parakeet_eou.rs     # EOU streaming facade
 │   ├── parakeet_unified.rs # Unified RNNT facade
 │   ├── nemotron.rs         # Nemotron streaming (EN + multilingual)
-│   ├── sortformer.rs       # Diarization [feature sortformer]; SessionRouter
+│   ├── sortformer.rs       # Diarization [feature sortformer]; SessionRouter, StreamPost, feed/feed_raw
 │   ├── multitalker.rs      # Multi-speaker ASR [feature multitalker]
 │   ├── cohere.rs           # Cohere ASR [feature cohere]
 │   ├── ark_asr.rs          # Ark ASR speech-LLM facade [feature ark-asr]
@@ -334,7 +372,7 @@ parakeet-rs/
 │   └── timestamps.rs       # Token/word/sentence grouping
 ├── examples/               # Runnable demos (need local model dirs)
 ├── tests/                  # model_benchmark.rs (weight-gated WER/DER) + common/mod.rs + auto_traits.rs
-├── scripts/                # NeMo → ONNX export (+ local quantize, CTC metadata patch)
+├── scripts/                # NeMo → ONNX export (+ local quantize, CTC metadata patch, Nemotron-3 diarization export)
 │   └── benchmark/          # run_all.sh, manifest.toml, compare_greedy_beam.py
 ├── plans/                  # Design docs (BEAM_SEARCH_IMPLEMENTATION_PLAN.md, WEBGPU_IMPLEMENTATION_PLAN.md)
 └── .github/workflows/rust.yml
@@ -352,6 +390,7 @@ parakeet-rs/
 | Multitalker | `encoder*.onnx`, `decoder_joint*.onnx`, `tokenizer.model` + Sortformer ONNX |
 | Cohere | `encoder_model.onnx`, `decoder_model_merged.onnx`, `tokenizer.json` |
 | Sortformer | `diar_streaming_sortformer_4spk-v2*.onnx` or 8spk exports with `num_speakers` metadata |
+| Nemotron-3-Diarization | `nemotron3_diar_<preset>[_int8].onnx` (single file, metadata stamped by the export script; `.nemo` + `config.json` kept alongside for re-export) |
 | Ark ASR | `runtime_manifest.json`, `audio_encoder_whisper_int8.onnx`, `audio_encoder_adapter_int8.onnx`, `embedding_fp32.onnx(.data)`, `llm_kv_cpu_fp32_int8.onnx`, `tokenizer.json`, `preprocessor_config.json` (root or under `model/`) |
 
 ---
