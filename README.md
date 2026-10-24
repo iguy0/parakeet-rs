@@ -8,6 +8,22 @@ Note: CoreML is unstable with this model. For Apple, use WebGPU EP (uses metal u
 
 ## Models
 
+### Streaming vs batch/offline
+
+| Model | Mode | State across calls |
+|---|---|---|
+| EOU | Streaming | Persistent encoder/decoder cache; feed fixed-size chunks in order |
+| Nemotron | Streaming | Persistent encoder cache + pre-encode buffer; feed fixed-size chunks in order |
+| Multitalker | Streaming | Persistent encoder cache + Sortformer speaker state; feed fixed-size chunks in order |
+| Sortformer | Streaming (`diarize_chunk`) or offline (`diarize`) | `diarize_chunk` preserves FIFO/speaker-cache state across calls; `diarize` runs a full file in one call |
+| Unified | Hybrid | `transcribe_audio`/`transcribe_file` (offline, no chunking) **or** `transcribe_chunk` + `flush` (buffered streaming with persisted cache) — same struct, `reset()` clears state |
+| CTC | Offline/batch | Stateless; one call per clip (~4-5 min limit) |
+| TDT | Offline/batch | Stateless; one call per clip (~4-5 min limit) |
+| Cohere Transcribe | Offline/batch | Stateless; one call per clip. Long-form audio just means the caller splits it and calls `transcribe_audio` repeatedly — no cache carries over between those calls |
+| Ark ASR | Offline/batch | Stateless; one call per clip, fixed-length KV cache sized by the model manifest, greedy-only |
+
+"Streaming" here means the model keeps encoder/decoder state (`*Cache`/`*Handle`) alive between calls so you can feed real-time audio chunk-by-chunk. "Offline/batch" means each call is independent — splitting long audio into pieces is just repeated one-shot calls, not shared streaming state.
+
 **CTC (English-only)**:
 ```rust
 use parakeet_rs::{Parakeet, Transcriber, TimestampMode};
@@ -147,9 +163,31 @@ See `examples/streaming_diarization.rs` for `diarize_chunk` usage example.
 
 See `scripts/export_diar_sortformer.py` for exporting the model with custom streaming parameters.
 
+**Ark ASR (Offline speech-LLM)**: Whisper-style audio encoder + Qwen2 causal LM, greedy decoding only
+```toml
+parakeet-rs = { version = "0.3", features = ["ark-asr"] }
+```
+```rust
+use parakeet_rs::{ArkAsr, Transcriber};
+
+let mut model = ArkAsr::from_pretrained("./ark-asr-0.6b-int8-onnx", None)?;
+model.set_max_new_tokens(256); // optional, default 256
+
+// audio: Vec<f32>, 16kHz mono, up to max_audio_seconds() (default 30s)
+let text = model.transcribe_audio(&audio)?;
+println!("{}", text);
+
+// or via the Transcriber trait:
+let result = model.transcribe_file("audio.wav", None)?;
+println!("{}", result.text);
+```
+See `examples/ark_asr.rs` for a runnable demo.
+
 ## Setup
 
 **CTC**: Download from [HuggingFace](https://huggingface.co/onnx-community/parakeet-ctc-0.6b-ONNX/tree/main/onnx): `model.onnx`, `model.onnx_data`, `tokenizer.json`
+
+**CTC (Granite TurboCTC)**: Third-party CTC-family model, supported via metadata-driven `CtcConfig`. Download the [community ONNX export](https://huggingface.co/qwertz92/granite-speech-5.0-470m-turboctc-onnx), then stamp the CTC metadata once with `python scripts/patch_ctc_onnx_metadata.py --input onnx/model.onnx --in-place --preset granite-turbo-ctc` and load it like any other CTC model with `Parakeet::from_pretrained`.
 
 **TDT**: Download from [HuggingFace](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx): `encoder-model.onnx`, `encoder-model.onnx.data`, `decoder_joint-model.onnx`, `vocab.txt`
 
@@ -166,6 +204,10 @@ See `scripts/export_diar_sortformer.py` for exporting the model with custom stre
 **Cohere Transcribe**: Download from [HuggingFace](https://huggingface.co/onnx-community/cohere-transcribe-03-2026-ONNX): `encoder_model.onnx` (+ `.onnx_data*`), `decoder_model_merged.onnx` (+ `.onnx_data`), `tokenizer.json` (FP32, FP16, INT8, INT4 variants available)
 
 **Diarization (Sortformer v2 & v2.1)**: Download from [HuggingFace](https://huggingface.co/altunenes/parakeet-rs/tree/main): `diar_streaming_sortformer_4spk-v2.onnx` or `v2.1.onnx`.
+
+**Diarization (Sortformer Ultra, 8 speakers)**: Export with `scripts/export_ultra_diar_8spk.py`; the resulting ONNX carries `num_speakers=8` metadata and loads via the same `Sortformer::with_config` API.
+
+**Ark ASR**: Download the INT8 ONNX package from [HuggingFace](https://huggingface.co/Audio8/ark-asr-0.6b-int8-onnx): `runtime_manifest.json`, `audio_encoder_whisper_int8.onnx`, `audio_encoder_adapter_int8.onnx`, `embedding_fp32.onnx` (+ `.data`), `llm_kv_cpu_fp32_int8.onnx`, `tokenizer.json`, `preprocessor_config.json`
 
 Quantized versions available (int8). All files must be in the same directory.
 
@@ -197,6 +239,9 @@ let config = ExecutionConfig::new()
 - [Multitalker: Streaming multi-speaker ASR with speaker-kernel injection](https://huggingface.co/nvidia/multitalker-parakeet-streaming-0.6b-v1) ([ONNX int8](https://huggingface.co/smcleod/multitalker-parakeet-streaming-0.6b-v1-onnx-int8))
 - [Cohere Transcribe: Offline multilingual ASR (14 languages, long-form supported)](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) ([ONNX](https://huggingface.co/onnx-community/cohere-transcribe-03-2026-ONNX))
 - [Sortformer v2 & v2.1: Streaming speaker diarization (up to 4 speakers)](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2) NOTE: you can also download v2.1 model same way.
+- Sortformer Ultra: 8-speaker diarization export (`scripts/export_ultra_diar_8spk.py`)
+- [Ark ASR: Offline speech-LLM ASR (Whisper encoder + Qwen2 LM, greedy)](https://huggingface.co/Audio8/ark-asr-0.6b-int8-onnx)
+- Granite TurboCTC: third-party CTC-family model support via metadata-driven `CtcConfig` (`scripts/patch_ctc_onnx_metadata.py`)
 - Token-level timestamps (CTC, TDT)
 
 ## Notes

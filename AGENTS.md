@@ -69,7 +69,15 @@ git push-fork        # push current branch to origin (iguy0)
 | `src/nemotron.rs` | Modified | 560 ms chunk config comment + beam decoding hook |
 | `scripts/quantize_nemotron_streaming.py` | Untracked | Local INT8/INT4 quantization tooling (candidate for upstream) |
 | `scripts/export_ultra_diar_8spk.py` | Untracked | 8-speaker Sortformer export |
-| `src/sortformer.rs` | Modified | Metadata-driven `num_speakers` (default 4); enables 8spk ONNX |
+| `src/sortformer.rs` | Modified | Metadata-driven `num_speakers` (default 4); enables 8spk ONNX; `SessionRouter` trait + `set_session_router`; `diarize()` split into `predict_raw()` + `post_process()` |
+| `src/config.rs` | Modified | `CtcConfig`/`CtcFrontendConfig`/`NormalizationMode` — metadata-driven CTC blank-id/token-offset/frontend (deltas, frame stacking, db-floor normalization, encoder subsample), read from ONNX `metadata_props` with Parakeet-CTC-0.6b defaults when absent |
+| `scripts/patch_ctc_onnx_metadata.py` | Added | Stamps `ctc_*` metadata keys onto third-party CTC ONNX graphs (e.g. Granite TurboCTC) so `CtcConfig::from_metadata` picks them up |
+| `src/model.rs` | Modified | Reads `CtcConfig` from session metadata at load time via `ctc_config_from_session` |
+| `src/execution.rs` | Modified | `ModelConfig::build_session()` public; `ModelConfig` is `Send + Sync` (`configure` hook now `Arc<dyn Fn(...) + Send + Sync>`); `coreml_cache_dir` (skip CoreML recompilation); `webgpu_device_id` *(feature `webgpu`)*; forces sequential execution + disabled memory pattern for WebGPU/DirectML |
+| `src/model_tdt.rs` | Modified | `ParakeetTDTModel::from_pretrained_with_configs` — separate `ExecutionConfig` for the encoder vs. the decoder/joint session |
+| `src/ark_asr.rs`, `src/model_ark.rs` | Added | `ArkAsr` speech-LLM transcriber *(feature `ark-asr`)* — Whisper-style audio encoder + adapter + Qwen2 causal LM with static KV cache, for `Audio8/ark-asr-0.6b-int8-onnx` |
+| `tests/auto_traits.rs` | Added | Compile-time `Send`/`Sync` assertion for `Sortformer` (gated on feature `sortformer`) |
+| `plans/WEBGPU_IMPLEMENTATION_PLAN.md` | Added | WebGPU EP validation plan/progress (Linux Vulkan dev, Windows D3D12 path, Nemotron-only correctness policy) |
 | `AGENTS.md` | Untracked | This file |
 
 ---
@@ -80,8 +88,8 @@ git push-fork        # push current branch to origin (iguy0)
 
 | Layer | Technology |
 |-------|------------|
-| Language | Rust 2021 (`parakeet-rs` v0.3.6) |
-| Inference | [ort](https://docs.rs/ort) 2.0.0-rc.12 (ONNX Runtime bindings) |
+| Language | Rust 2024 (`parakeet-rs` v0.3.7) |
+| Inference | [ort](https://docs.rs/ort) 2.0.0-rc.13 (ONNX Runtime bindings) |
 | Arrays | `ndarray` 0.17 |
 | Tokenizers | `tokenizers` 0.23 (CTC/EOU/Cohere), custom SentencePiece (Nemotron/TDT/Unified) |
 | Audio I/O | `hound` (WAV), `realfft` (STFT/mel) |
@@ -120,8 +128,9 @@ Optional Cargo features gate heavier modules: `sortformer`, `multitalker` (impli
 | **TDT (Multilingual, 25 langs)** | `ParakeetTDT` | `src/parakeet_tdt.rs` | `src/model_tdt.rs` | `src/decoder_tdt.rs` + `src/vocab.rs` |
 | **Unified (offline + buffered streaming RNNT)** | `ParakeetUnified`, `ParakeetUnifiedHandle` | `src/parakeet_unified.rs` | `src/model_unified.rs` | SentencePiece via `nemotron::SentencePieceVocab` |
 | **Cohere Transcribe (14 langs, long-form)** | `CohereASR` *(feature `cohere`)* | `src/cohere.rs` | `src/model_cohere.rs` | HuggingFace `Tokenizer` + prompt tokens |
+| **Ark ASR (speech-LLM, greedy only)** | `ArkAsr` *(feature `ark-asr`)* | `src/ark_asr.rs` | `src/model_ark.rs` | HuggingFace `Tokenizer` (Qwen2 vocab) + prompt/audio-token assembly |
 
-**Shared offline path:** `Transcriber` trait (`src/transcriber.rs`) → `audio::extract_features_with_cache` → model forward → decode → `timestamps::process_timestamps`.
+**Shared offline path:** `Transcriber` trait (`src/transcriber.rs`) → `audio::extract_features_with_cache` → model forward → decode → `timestamps::process_timestamps`. `ArkAsr` follows the `Transcriber` trait too, but uses its own Whisper-log-mel frontend (`audio::extract_whisper_logmel`) and an autoregressive LLM decode loop instead of CTC/RNNT decoding — it does not participate in the beam-search or `TimestampMode` machinery below.
 
 **Decoding strategy:** CTC, TDT, and Unified (RNNT) — plus Nemotron streaming — support optional **beam search** via `DecodingStrategy::Beam(BeamConfig)`. Greedy stays the default; opt in with `from_pretrained_with_decoding(...)` or `set_decoding_strategy(...)`. `BeamConfig` field applicability per family is documented in `src/decoding/mod.rs` (not all fields are honored by all decoders — e.g. `patience` is TDT-only, `length_penalty` is RNNT/TDT-only).
 
@@ -143,22 +152,36 @@ Optional Cargo features gate heavier modules: `sortformer`, `multitalker` (impli
 
 | Feature | Public API | Core Logic | Entry Points |
 |---------|------------|------------|--------------|
-| **Sortformer v2/v2.1 (4 speakers)** | `sortformer::Sortformer` *(feature `sortformer`)* | `src/sortformer.rs` | `diarize()`, `diarize_chunk()` |
+| **Sortformer v2/v2.1 (4 speakers)** | `sortformer::Sortformer` *(feature `sortformer`)* | `src/sortformer.rs` | `diarize()` (= `predict_raw()` + `post_process()`), `diarize_chunk()` |
 | **Sortformer + TDT combined** | Example composition | `examples/diarization.rs` | Offline full-file |
 | **Streaming diarization** | `Sortformer::diarize_chunk` | `src/sortformer.rs` | `examples/streaming_diarization.rs` |
 
 Post-processing: `DiarizationConfig` presets (`callhome()`, `dihard3()`, `custom()`).
 
+### Streaming vs Batch/Chunk Summary
+
+"Streaming" (this table) means an encoder/decoder cache persists across calls on the same instance (`EncoderCache`/`NemotronEncoderCache`/`MultitalkerEncoderCache`, LSTM decoder states, FIFO/speaker-cache), so audio is fed chunk-by-chunk in real time. "Batch/offline" means each call is stateless — feeding "chunks" (e.g. Cohere's ≤35 s training window) is just the caller splitting long audio and calling the same one-shot API repeatedly, with no cache continuity between calls.
+
+| Model | Category | Notes |
+|-------|----------|-------|
+| CTC, TDT | Batch/offline only | `Transcriber` trait, one call per clip, ~4-5 min limit |
+| Cohere Transcribe | Batch/offline only | `transcribe_audio` one-shot; caller chunks long-form audio manually, no persisted cache |
+| Ark ASR | Batch/offline only | Fixed-length static KV cache sized by model manifest; no chunk/streaming API |
+| EOU, Nemotron, Multitalker | Streaming only | `*Handle` + chunk method; see Streaming ASR table above |
+| Sortformer | Both | `diarize()` = offline full-file; `diarize_chunk()` = streaming with persisted FIFO/cache |
+| Unified (RNNT) | Both (hybrid, same struct) | `transcribe_audio`/`transcribe_file` (offline) vs `transcribe_chunk` + `flush` (buffered streaming per `UnifiedStreamingConfig`); `reset()` clears streaming state |
+
 ### Cross-Cutting Infrastructure
 
 | Concern | Location | Notes |
 |---------|----------|-------|
-| Audio load + mel/STFT | `src/audio.rs` | **Must use FFT** — naive DFT breaks models (comment at L70–73) |
-| Execution providers | `src/execution.rs` | `ExecutionProvider`, `CoreMLComputeUnits`, `ModelConfig::build_session()`; GPU EPs fall back to CPU |
-| Decoding strategy | `src/decoding/` | `DecodingStrategy` (Greedy default / Beam) + `BeamConfig`; per-family beam decoders (`ctc_beam`, `tdt_beam`, `rnnt_beam`). Opt in via `*_with_decoding` constructors or `set_decoding_strategy` |
+| Audio load + mel/STFT | `src/audio.rs` | **Must use FFT** — naive DFT breaks models (comment at L70–73); `extract_whisper_logmel` variant feeds `ArkAsr` |
+| Execution providers | `src/execution.rs` | `ExecutionProvider`, `CoreMLComputeUnits`, public `ModelConfig::build_session()`; `ModelConfig` is `Send + Sync`; `coreml_cache_dir`, `webgpu_device_id` *(feature `webgpu`)*; GPU EPs fall back to CPU; WebGPU/DirectML forced sequential + no memory pattern |
+| Decoding strategy | `src/decoding/` | `DecodingStrategy` (Greedy default / Beam) + `BeamConfig`; per-family beam decoders (`ctc_beam`, `tdt_beam`, `rnnt_beam`). Opt in via `*_with_decoding` constructors or `set_decoding_strategy`. `ArkAsr` is greedy-only (LLM decode loop, not a beam-eligible decoder) |
 | Timestamps | `src/timestamps.rs`, `src/decoder.rs` | `TimestampMode`: Tokens / Words / Sentences |
 | ONNX tensor helpers | `src/tensor_utils.rs` | Flat/3D/4D f32 extraction from `ort` outputs |
-| Config structs | `src/config.rs` | `PreprocessorConfig`, `ModelConfig` (CTC defaults hardcoded) |
+| Config structs | `src/config.rs` | `PreprocessorConfig`, `ModelConfigJson` (`config.json`-shaped, still Parakeet-CTC-0.6b defaults); `CtcConfig`/`CtcFrontendConfig`/`NormalizationMode` are metadata-driven (`CtcConfig::from_metadata`, read from ONNX `metadata_props` by `src/model.rs`) — see `scripts/patch_ctc_onnx_metadata.py` |
+| Session routing (diarization) | `src/sortformer.rs` | `SessionRouter` trait + `Sortformer::set_session_router` — supplies a session per `(chunk, spkcache, fifo)` window for graphs with fixed input shapes (e.g. multi-shape exports); `graph_window()` inspects a session's static input dims |
 | Errors | `src/error.rs` | `Result<T>`, variants: Io, Ort, Audio, Model, Tokenizer, Config |
 
 ### Export & Quantization Scripts
@@ -175,8 +198,9 @@ Post-processing: `DiarizationConfig` presets (`callhome()`, `dihard3()`, `custom
 | `scripts/export_ultra_diar_8spk.py` | 8-speaker Sortformer export | `sortformer.rs` reads `num_speakers` from ONNX metadata |
 | `scripts/benchmark/run_all.sh` | Greedy-vs-beam example harness (env-driven model/clip selection) | Drives `examples/*` with `--decoding greedy|beam` |
 | `scripts/benchmark/compare_greedy_beam.py` | Transcript edit-distance / optional WER diff for greedy vs beam | Consumed by `run_all.sh` |
+| `scripts/patch_ctc_onnx_metadata.py` | Stamps `ctc_*` `metadata_props` (blank id, token offset, frontend deltas/stacking/normalization, encoder subsample) onto third-party single-file CTC ONNX graphs | `config.rs` `CtcConfig::from_metadata`, `model.rs` `ctc_config_from_session` |
 
-Cohere uses upstream Optimum export — no custom script in-repo (`cohere.rs` documents CLI).
+Cohere uses upstream Optimum export — no custom script in-repo (`cohere.rs` documents CLI). Ark ASR consumes a pre-built INT8 ONNX package from HuggingFace (`Audio8/ark-asr-0.6b-int8-onnx`) — no export script in-repo.
 
 ---
 
@@ -233,7 +257,8 @@ flowchart LR
 - **CTC/TDT length limit:** ~4–5 minutes per call; use streaming models or chunking for longer audio.
 - **Nemotron latency is export-time locked:** Changing `--right-context` in export requires updating `CHUNK_SIZE` in `src/nemotron.rs` (see table in `export_nemotron_streaming.py` header).
 - **Mel/STFT must match training:** Custom STFT in Rust (librosa-inspired for Sortformer); do not swap for naive DFT.
-- **CTC config hardcoded:** `ModelConfig` and `pad_token_id` in `model.rs` / `decoder.rs` assume Parakeet-CTC-0.6b — not read from `config.json` at runtime.
+- **CTC config is metadata-driven, not `config.json`-driven:** `CtcConfig` (blank id, token offset, frontend deltas/stacking/normalization, encoder subsample) is read from ONNX `metadata_props` at session-load time (`model.rs` `ctc_config_from_session`), falling back to Parakeet-CTC-0.6b defaults when absent. Third-party graphs (e.g. Granite TurboCTC) need `scripts/patch_ctc_onnx_metadata.py` run once to stamp the keys; `ModelConfigJson`/`PreprocessorConfig` in `config.rs` still assume Parakeet-CTC-0.6b shapes and are not read from `config.json` at runtime.
+- **`ArkAsr` (feature `ark-asr`) is a fixed-length KV cache:** `max_total_len` comes from the loaded model's manifest; `prompt_len + max_new_tokens` must not exceed it or `decode_greedy` errors. No beam search, streaming, or `TimestampMode` support.
 
 ### Known Gotchas
 
@@ -246,12 +271,14 @@ flowchart LR
 | **Multilingual Nemotron langs** | Prompt dictionary embedded in `nemotron.rs`; 8 "adaptation-ready" langs need fine-tuning for production quality |
 | **Sortformer + multitalker** | Multitalker depends on Sortformer raw predictions for speaker masks |
 | **Threading** | Streaming handles use `Arc<Mutex<...>>` for ONNX sessions — avoid hot-path lock contention in multi-stream servers |
+| **Sortformer `SessionRouter`** | Optional trait to swap sessions per streaming window shape; must stay `Send + Sync` (enforced by `tests/auto_traits.rs`) since it lives behind `Sortformer`'s own auto-trait bounds |
+| **`ModelConfig::configure` closures** | Must be `Send + Sync + 'static` (wrapped in `Arc`) now that `ModelConfig` itself is `Send + Sync` — custom `SessionBuilder` closures capturing non-`Sync` state will fail to compile |
 
 ### Linting / Style
 
-- Rust 2021, standard `cargo fmt` / `cargo clippy` expectations (not enforced in CI beyond build+test).
+- Rust 2024, standard `cargo fmt` / `cargo clippy` expectations (not enforced in CI beyond build+test).
 - Module layout: one `model_*.rs` per ONNX graph family; public facades in `parakeet_*.rs` / top-level names.
-- Feature gates: never expose `sortformer`/`multitalker`/`cohere` symbols without the corresponding feature.
+- Feature gates: never expose `sortformer`/`multitalker`/`cohere`/`ark-asr` symbols without the corresponding feature.
 
 ### Testing
 
@@ -259,7 +286,8 @@ flowchart LR
 - **Weight-gated:** when models under `models/` (or `PARAKEET_*` env overrides) are missing, each test prints a skip notice and passes, so CI without weights stays green. The 20 s smoke clip is asserted when weights are present (`SMOKE_MAX_WER` ceiling, default 0.15).
 - Run: `cargo test --release --test model_benchmark --features "sortformer multitalker cohere" -- --nocapture`. Set `PARAKEET_BENCH_ALL=1` to include the long (~10–29 min) clips.
 - **Greedy-vs-beam harness:** `scripts/benchmark/run_all.sh` (config in `manifest.toml`) drives the examples in both decodings and diffs transcripts via `compare_greedy_beam.py`; all model dirs/clips are env-overridable and skip gracefully.
-- Validation is otherwise manual via `examples/` with downloaded ONNX weights.
+- **Auto-trait tests:** `tests/auto_traits.rs` asserts `Sortformer: Send + Sync` at compile time (gated on feature `sortformer`); extend similarly if new public types pick up `Arc<dyn Fn>`/session-router style fields.
+- Validation is otherwise manual via `examples/` with downloaded ONNX weights (including `examples/ark_asr.rs`, feature `ark-asr`).
 
 ---
 
@@ -272,9 +300,11 @@ flowchart LR
 | High | Parameterize `NUM_SPEAKERS` in Sortformer (read from ONNX metadata, default 4) | **Done locally** — `sortformer.rs` |
 | Medium | Beam search (CTC/TDT/RNNT) | **Done locally** — `src/decoding/`; remaining: optional LM rescoring, honor `patience`/`length_penalty` uniformly across families |
 | Medium | Model-backed WER/DER benchmark suite | **Done locally** — `tests/model_benchmark.rs` (real-weight, weight-gated). Remaining: tiny fixture ONNX graphs for weight-free CI |
-| Medium | Load CTC/TDT configs from JSON instead of hardcoding | `config.rs`, `model.rs` |
+| Medium | Load CTC configs from metadata instead of hardcoding | **Done locally** — `config.rs` `CtcConfig::from_metadata` + `scripts/patch_ctc_onnx_metadata.py`. Remaining: same treatment for TDT (`model_tdt.rs` still assumes fixed vocab/shape); `ModelConfigJson`/`PreprocessorConfig` still not read from `config.json` at runtime |
+| Medium | WebGPU EP validation (Linux dev → Windows 11 D3D12 certification) | **In progress** — `plans/WEBGPU_IMPLEMENTATION_PLAN.md`; Nemotron still blocked on `ort` rc.12/rc.13 Vulkan Slice validation |
 | Low | CoreML graph rewriting for static shapes | `execution.rs` |
 | Low | Batch transcription API (currently sequential in `transcriber.rs`) | `Transcriber` trait |
+| Low | Beam search / streaming support for `ArkAsr` | `src/ark_asr.rs` (currently greedy-only, fixed KV cache) |
 
 ---
 
@@ -293,18 +323,20 @@ parakeet-rs/
 │   ├── parakeet_eou.rs     # EOU streaming facade
 │   ├── parakeet_unified.rs # Unified RNNT facade
 │   ├── nemotron.rs         # Nemotron streaming (EN + multilingual)
-│   ├── sortformer.rs       # Diarization [feature sortformer]
+│   ├── sortformer.rs       # Diarization [feature sortformer]; SessionRouter
 │   ├── multitalker.rs      # Multi-speaker ASR [feature multitalker]
 │   ├── cohere.rs           # Cohere ASR [feature cohere]
-│   ├── model*.rs           # ONNX session wrappers
+│   ├── ark_asr.rs          # Ark ASR speech-LLM facade [feature ark-asr]
+│   ├── model*.rs           # ONNX session wrappers (incl. model_ark.rs)
 │   ├── decoder*.rs         # CTC / TDT greedy decoders
 │   ├── decoding/           # Beam search: mod.rs (DecodingStrategy/BeamConfig) + ctc/tdt/rnnt_beam.rs
+│   ├── config.rs           # PreprocessorConfig, ModelConfigJson, CtcConfig (metadata-driven)
 │   └── timestamps.rs       # Token/word/sentence grouping
 ├── examples/               # Runnable demos (need local model dirs)
-├── tests/                  # model_benchmark.rs (weight-gated WER/DER) + common/mod.rs
-├── scripts/                # NeMo → ONNX export (+ local quantize)
+├── tests/                  # model_benchmark.rs (weight-gated WER/DER) + common/mod.rs + auto_traits.rs
+├── scripts/                # NeMo → ONNX export (+ local quantize, CTC metadata patch)
 │   └── benchmark/          # run_all.sh, manifest.toml, compare_greedy_beam.py
-├── plans/                  # Design docs (e.g. BEAM_SEARCH_IMPLEMENTATION_PLAN.md)
+├── plans/                  # Design docs (BEAM_SEARCH_IMPLEMENTATION_PLAN.md, WEBGPU_IMPLEMENTATION_PLAN.md)
 └── .github/workflows/rust.yml
 ```
 
@@ -320,6 +352,7 @@ parakeet-rs/
 | Multitalker | `encoder*.onnx`, `decoder_joint*.onnx`, `tokenizer.model` + Sortformer ONNX |
 | Cohere | `encoder_model.onnx`, `decoder_model_merged.onnx`, `tokenizer.json` |
 | Sortformer | `diar_streaming_sortformer_4spk-v2*.onnx` or 8spk exports with `num_speakers` metadata |
+| Ark ASR | `runtime_manifest.json`, `audio_encoder_whisper_int8.onnx`, `audio_encoder_adapter_int8.onnx`, `embedding_fp32.onnx(.data)`, `llm_kv_cpu_fp32_int8.onnx`, `tokenizer.json`, `preprocessor_config.json` (root or under `model/`) |
 
 ---
 
