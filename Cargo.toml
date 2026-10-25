@@ -48,7 +48,7 @@ path = "examples/ark_asr.rs"
 required-features = ["ark-asr"]
 
 [dependencies]
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray"] }
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "ndarray"] }
 hound = "3.5"
 eyre = "0.6"
 ndarray = "0.17"

@@ -46,6 +46,23 @@ pub enum CoreMLComputeUnits {
     CpuOnly,
 }
 
+/// Process-wide ONNX Runtime environment (required by `ort` 2.0.0-rc.14+).
+/// The `ort` crate only keeps a weak reference to the current environment, so
+/// it is held here for the lifetime of the process.
+pub(crate) fn default_environment() -> Result<&'static ort::environment::Environment> {
+    static ENV: std::sync::OnceLock<ort::environment::Environment> = std::sync::OnceLock::new();
+    static INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if let Some(env) = ENV.get() {
+        return Ok(env);
+    }
+    let _guard = INIT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(env) = ENV.get() {
+        return Ok(env);
+    }
+    let env = ort::init().build()?;
+    Ok(ENV.get_or_init(|| env))
+}
+
 #[derive(Clone)]
 pub struct ModelConfig {
     pub execution_provider: ExecutionProvider,
@@ -151,7 +168,7 @@ impl ModelConfig {
 
     /// Build a session for `path` under this configuration.
     pub fn build_session(&self, path: &Path) -> Result<Session> {
-        let builder = Session::builder()?;
+        let builder = Session::builder(default_environment()?)?;
         let mut builder = self.apply_to_session_builder(builder)?;
         Ok(builder.commit_from_file(path)?)
     }
