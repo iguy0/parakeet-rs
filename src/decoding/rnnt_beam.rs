@@ -82,15 +82,15 @@ pub fn decode_rnnt_beam(
             .slice(ndarray::s![0, .., frame_idx])
             .to_owned()
             .to_shape((1, hidden_dim, 1))
-            .map_err(|e| crate::error::Error::Model(format!("Failed to reshape encoder frame: {e}")))?
+            .map_err(|e| {
+                crate::error::Error::Model(format!("Failed to reshape encoder frame: {e}"))
+            })?
             .to_owned();
 
         let absolute_frame = absolute_frame_offset + (frame_idx - start_frame);
 
-        let mut active: Vec<RnntHypothesis> = beam
-            .into_iter()
-            .filter(|h| h.frame == frame_idx)
-            .collect();
+        let mut active: Vec<RnntHypothesis> =
+            beam.into_iter().filter(|h| h.frame == frame_idx).collect();
         active = prune_beam(active, config);
 
         let mut advanced = Vec::new();
@@ -103,12 +103,8 @@ pub fn decode_rnnt_beam(
             let mut symbol_candidates = Vec::new();
 
             for hyp in &active {
-                let (logits, new_state_1, new_state_2) = decoder(
-                    &frame,
-                    hyp.last_token,
-                    &hyp.state_1,
-                    &hyp.state_2,
-                )?;
+                let (logits, new_state_1, new_state_2) =
+                    decoder(&frame, hyp.last_token, &hyp.state_1, &hyp.state_2)?;
 
                 let log_probs = log_softmax(&logits);
                 for token_id in top_k_indices(&log_probs, config.beam_size) {
@@ -149,12 +145,7 @@ pub fn decode_rnnt_beam(
 
         // Greedy parity: paths that hit max_symbols_per_step still advance via blank.
         for hyp in active {
-            let (logits, _, _) = decoder(
-                &frame,
-                hyp.last_token,
-                &hyp.state_1,
-                &hyp.state_2,
-            )?;
+            let (logits, _, _) = decoder(&frame, hyp.last_token, &hyp.state_1, &hyp.state_2)?;
             let log_probs = log_softmax(&logits);
             let mut next = hyp;
             next.score += log_probs[blank_id];
@@ -223,8 +214,7 @@ fn prune_beam(mut hyps: Vec<RnntHypothesis>, config: &BeamConfig) -> Vec<RnntHyp
 }
 
 fn select_best(hyps: &[RnntHypothesis], length_penalty: f32) -> Option<RnntHypothesis> {
-    hyps
-        .iter()
+    hyps.iter()
         .max_by(|a, b| {
             length_normalized_score(a, length_penalty)
                 .partial_cmp(&length_normalized_score(b, length_penalty))
@@ -239,9 +229,7 @@ fn length_normalized_score(hyp: &RnntHypothesis, length_penalty: f32) -> f32 {
 }
 
 fn log_softmax(logits: &Array1<f32>) -> Array1<f32> {
-    let max_logit = logits
-        .iter()
-        .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let exps: Vec<f32> = logits.iter().map(|&x| (x - max_logit).exp()).collect();
     let sum: f32 = exps.iter().sum();
     let log_sum = sum.ln() + max_logit;
@@ -250,15 +238,9 @@ fn log_softmax(logits: &Array1<f32>) -> Array1<f32> {
 
 fn top_k_indices(log_probs: &Array1<f32>, k: usize) -> Vec<usize> {
     let k = k.min(log_probs.len());
-    let mut indexed: Vec<(usize, f32)> = log_probs
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| (i, v))
-        .collect();
-    indexed.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let mut indexed: Vec<(usize, f32)> =
+        log_probs.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     indexed.into_iter().take(k).map(|(i, _)| i).collect()
 }
 
@@ -418,20 +400,12 @@ mod tests {
             patience: 3.5,
             max_symbols_per_step: 5,
             duration_reward: 0.67,
+            frame_topk: 0,
         };
 
         let mut decoder = mock_decoder;
-        let out = decode_rnnt_beam(
-            &enc,
-            0,
-            2,
-            0,
-            blank_id,
-            &config,
-            Vec::new(),
-            &mut decoder,
-        )
-        .unwrap();
+        let out =
+            decode_rnnt_beam(&enc, 0, 2, 0, blank_id, &config, Vec::new(), &mut decoder).unwrap();
 
         assert_eq!(out.new_tokens, vec![(1, 0), (2, 1)]);
         assert!(!out.hypotheses.is_empty());
@@ -458,17 +432,8 @@ mod tests {
         };
 
         let mut decoder = mock_decoder;
-        let out = decode_rnnt_beam(
-            &enc,
-            1,
-            2,
-            1,
-            blank_id,
-            &config,
-            vec![seed],
-            &mut decoder,
-        )
-        .unwrap();
+        let out =
+            decode_rnnt_beam(&enc, 1, 2, 1, blank_id, &config, vec![seed], &mut decoder).unwrap();
 
         assert_eq!(out.new_tokens, vec![(2, 1)]);
     }
@@ -480,8 +445,8 @@ mod tests {
         let config = BeamConfig::default_unified();
 
         let mut decoder = mock_decoder;
-        let out = decode_rnnt_beam(&enc, 0, 2, 0, blank_id, &config, Vec::new(), &mut decoder)
-            .unwrap();
+        let out =
+            decode_rnnt_beam(&enc, 0, 2, 0, blank_id, &config, Vec::new(), &mut decoder).unwrap();
 
         assert!(!out.hypotheses.is_empty());
         assert!(out.hypotheses.iter().all(|h| h.frame == 2));
@@ -499,8 +464,8 @@ mod tests {
         let config = BeamConfig::default_unified();
         let mut decoder = mock_decoder;
 
-        let single = decode_rnnt_beam(&enc, 0, 2, 0, blank_id, &config, Vec::new(), &mut decoder)
-            .unwrap();
+        let single =
+            decode_rnnt_beam(&enc, 0, 2, 0, blank_id, &config, Vec::new(), &mut decoder).unwrap();
 
         let chunk0 =
             decode_rnnt_beam(&enc, 0, 1, 0, blank_id, &config, Vec::new(), &mut decoder).unwrap();

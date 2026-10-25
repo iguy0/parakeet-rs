@@ -70,12 +70,8 @@ pub fn decode_tdt_beam(
                 .map_err(|e| crate::error::Error::Model(format!("Failed to reshape frame: {e}")))?
                 .to_owned();
 
-            let (vocab_logits, duration_logits, new_state_1, new_state_2) = decoder(
-                &frame,
-                hyp.last_token,
-                &hyp.state_1,
-                &hyp.state_2,
-            )?;
+            let (vocab_logits, duration_logits, new_state_1, new_state_2) =
+                decoder(&frame, hyp.last_token, &hyp.state_1, &hyp.state_2)?;
 
             let token_log_probs = log_softmax(&vocab_logits);
             let duration_log_probs = log_softmax(&duration_logits);
@@ -84,11 +80,7 @@ pub fn decode_tdt_beam(
                 let is_blank = token_id == blank_id;
                 for duration_idx in top_k_indices(&duration_log_probs, beam_duration) {
                     let duration = TDT_DURATIONS[duration_idx];
-                    let stuck = if duration != 0 {
-                        0
-                    } else {
-                        hyp.stuck + 1
-                    };
+                    let stuck = if duration != 0 { 0 } else { hyp.stuck + 1 };
 
                     let new_step = if stuck >= config.max_symbols_per_step {
                         hyp.step + 1
@@ -119,8 +111,7 @@ pub fn decode_tdt_beam(
                         next.last_token = token_id as i32;
                         next.state_1 = new_state_1.clone();
                         next.state_2 = new_state_2.clone();
-                        next.tokens
-                            .push((token_id, hyp.step, duration));
+                        next.tokens.push((token_id, hyp.step, duration));
                     }
 
                     merge_candidate(&mut candidates, next);
@@ -151,9 +142,8 @@ pub fn decode_tdt_beam(
     let mut all = finished;
     all.extend(active);
 
-    let best = select_best(&all, config.length_penalty).unwrap_or_else(|| {
-        seed_hypothesis(blank_id, state_shape)
-    });
+    let best = select_best(&all, config.length_penalty)
+        .unwrap_or_else(|| seed_hypothesis(blank_id, state_shape));
 
     let mut tokens = Vec::new();
     let mut frame_indices = Vec::new();
@@ -207,8 +197,7 @@ fn merge_candidate(
 }
 
 fn select_best(hyps: &[TdtHypothesis], length_penalty: f32) -> Option<TdtHypothesis> {
-    hyps
-        .iter()
+    hyps.iter()
         .max_by(|a, b| {
             length_normalized_score(a, length_penalty)
                 .partial_cmp(&length_normalized_score(b, length_penalty))
@@ -223,9 +212,7 @@ fn length_normalized_score(hyp: &TdtHypothesis, length_penalty: f32) -> f32 {
 }
 
 fn log_softmax(logits: &Array1<f32>) -> Array1<f32> {
-    let max_logit = logits
-        .iter()
-        .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let exps: Vec<f32> = logits.iter().map(|&x| (x - max_logit).exp()).collect();
     let sum: f32 = exps.iter().sum();
     let log_sum = sum.ln() + max_logit;
@@ -234,15 +221,9 @@ fn log_softmax(logits: &Array1<f32>) -> Array1<f32> {
 
 fn top_k_indices(log_probs: &Array1<f32>, k: usize) -> Vec<usize> {
     let k = k.min(log_probs.len());
-    let mut indexed: Vec<(usize, f32)> = log_probs
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| (i, v))
-        .collect();
-    indexed.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let mut indexed: Vec<(usize, f32)> =
+        log_probs.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     indexed.into_iter().take(k).map(|(i, _)| i).collect()
 }
 
@@ -290,7 +271,12 @@ mod tests {
             }
         }
 
-        Ok((vocab_logits, duration_logits, state_1.clone(), state_2.clone()))
+        Ok((
+            vocab_logits,
+            duration_logits,
+            state_1.clone(),
+            state_2.clone(),
+        ))
     }
 
     fn synthetic_encoder(frames: usize, hidden: usize) -> Array3<f32> {
@@ -348,6 +334,7 @@ mod tests {
             patience: 3.5,
             max_symbols_per_step: 10,
             duration_reward: 0.67,
+            frame_topk: 0,
         };
 
         let mut decoder = mock_decoder;
@@ -385,7 +372,11 @@ mod tests {
         // stuck + 1 >= max_symbols_per_step (10) => advance by 1
         let duration = 0;
         let stuck = hyp.stuck + 1;
-        let new_step = if stuck >= 10 { hyp.step + 1 } else { hyp.step + duration };
+        let new_step = if stuck >= 10 {
+            hyp.step + 1
+        } else {
+            hyp.step + duration
+        };
         assert_eq!(new_step, 1);
     }
 }

@@ -16,10 +16,10 @@ use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_multitalker::{MultitalkerEncoderCache, MultitalkerModel};
 use crate::nemotron::SentencePieceVocab;
-use crate::sortformer::{Sortformer, DEFAULT_NUM_SPEAKERS};
+use crate::sortformer::{DEFAULT_NUM_SPEAKERS, Sortformer};
 use crate::timestamps::{self, TimestampMode};
 use crate::transcriber::Transcriber;
-use ndarray::{s, Array2, Array3};
+use ndarray::{Array2, Array3, ArrayView2, Axis, s};
 use std::path::Path;
 
 // Reuse the same audio constants as Nemotron (same encoder architecture)
@@ -37,9 +37,13 @@ const HIDDEN_DIM: usize = 1024;
 const LEFT_CONTEXT: usize = 70;
 const CONV_CONTEXT: usize = 8;
 
-// Decoder
-const VOCAB_SIZE: usize = 1024;
-const BLANK_ID: usize = 1024;
+// Decoder fallbacks. The loaded tokenizer and joint-network output replace these
+// when they agree (RNNT blank is the class after the SentencePiece pieces).
+const FALLBACK_VOCAB_SIZE: usize = 1024;
+const FALLBACK_BLANK_ID: usize = 1024;
+
+/// Mel frames (10 ms) per Sortformer frame (80 ms).
+const MEL_FRAMES_PER_DIAR_FRAME: usize = 8;
 const DECODER_LSTM_DIM: usize = 640;
 const MAX_SYMBOLS_PER_STEP: usize = 10;
 
@@ -73,7 +77,7 @@ struct SpeakerInstance {
 }
 
 impl SpeakerInstance {
-    fn new(speaker_id: usize) -> Self {
+    fn new(speaker_id: usize, blank_id: usize) -> Self {
         Self {
             encoder_cache: MultitalkerEncoderCache::new(
                 NUM_ENCODER_LAYERS,
@@ -83,7 +87,7 @@ impl SpeakerInstance {
             ),
             state_1: Array3::zeros((2, 1, DECODER_LSTM_DIM)),
             state_2: Array3::zeros((2, 1, DECODER_LSTM_DIM)),
-            last_token: BLANK_ID as i32,
+            last_token: blank_id as i32,
             accumulated_tokens: Vec::new(),
             speaker_id,
         }
@@ -127,10 +131,10 @@ impl LatencyMode {
     /// Number of mel spectrogram frames per encoder chunk.
     pub const fn chunk_mel_frames(self) -> usize {
         match self {
-            Self::Normal => 112,  // 14 * 8
-            Self::Low => 56,      //  7 * 8
-            Self::VeryLow => 16,  //  2 * 8
-            Self::Ultra => 8,     //  1 * 8
+            Self::Normal => 112, // 14 * 8
+            Self::Low => 56,     //  7 * 8
+            Self::VeryLow => 16, //  2 * 8
+            Self::Ultra => 8,    //  1 * 8
         }
     }
 
@@ -155,6 +159,31 @@ impl LatencyMode {
     }
 }
 
+/// How each ASR chunk obtains Sortformer speaker probabilities.
+///
+/// [`PerChunk`](Self::PerChunk) is the historical behavior. [`Buffered`](Self::Buffered)
+/// runs Sortformer on its own window and holds ASR chunks until those frames exist.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DiarStrategy {
+    /// Call `Sortformer::diarize_chunk_raw` on every ASR chunk.
+    ///
+    /// The ASR chunk (1.12 s in [`LatencyMode::Normal`]) is shorter than a
+    /// Sortformer window (about 10 s on the default 4-speaker export), so each
+    /// call pads up to that window. This is the default.
+    #[default]
+    PerChunk,
+    /// Feed audio with `Sortformer::feed_raw` and queue the 80 ms probability
+    /// frames. An ASR chunk runs only once queued frames cover its time range,
+    /// and [`MultitalkerASR::flush`] (or the silence tail inside
+    /// [`MultitalkerASR::transcribe_audio_multitalker`]) finishes the stream
+    /// with `flush_raw`.
+    ///
+    /// Latency grows by one Sortformer window ([`Sortformer::latency`](crate::sortformer::Sortformer::latency)):
+    /// `(chunk_len + right_context) * 80 ms`, about 10 s for the default export.
+    /// Text for that window arrives together once the window is ready.
+    Buffered,
+}
+
 /// Runtime configuration for the multitalker pipeline.
 ///
 /// These settings can be changed between calls to `transcribe_chunk()` via
@@ -174,6 +203,10 @@ pub struct MultitalkerConfig {
     /// Streaming latency mode. Controls the encoder chunk size and
     /// therefore the latency-accuracy tradeoff.
     pub latency_mode: LatencyMode,
+
+    /// Sortformer stride relative to ASR chunks.
+    /// [`DiarStrategy::PerChunk`] keeps one Sortformer call per ASR chunk.
+    pub diar_strategy: DiarStrategy,
 }
 
 impl Default for MultitalkerConfig {
@@ -182,6 +215,7 @@ impl Default for MultitalkerConfig {
             max_speakers: DEFAULT_NUM_SPEAKERS,
             activity_threshold: SPEAKER_ACTIVITY_THRESHOLD,
             latency_mode: LatencyMode::default(),
+            diar_strategy: DiarStrategy::default(),
         }
     }
 }
@@ -201,10 +235,18 @@ pub struct MultitalkerASR {
     vocab: SentencePieceVocab,
     speakers: Vec<SpeakerInstance>,
     config: MultitalkerConfig,
+    /// SentencePiece piece count used as the exclusive end of real token ids.
+    vocab_size: usize,
+    /// RNNT blank class. Equal to `vocab_size` for the current multitalker
+    /// export (1024 pieces, blank at 1024).
+    blank_id: usize,
     mel_basis: Array2<f32>,
     audio_buffer: Vec<f32>,
     audio_processed: usize,
     chunk_idx: usize,
+    /// Queued Sortformer frames for [`DiarStrategy::Buffered`], shape
+    /// `[frames, speakers]`, one row per 80 ms from the start of the stream.
+    diar_queue: Array2<f32>,
 }
 
 impl MultitalkerASR {
@@ -225,6 +267,7 @@ impl MultitalkerASR {
         let vocab = SentencePieceVocab::from_file(asr_dir.join("tokenizer.model"))?;
 
         let model = MultitalkerModel::from_pretrained(asr_dir, exec.clone())?;
+        let (vocab_size, blank_id) = token_layout(vocab.size(), model.decoder_output_classes());
         let sortformer = Sortformer::with_config(
             sortformer_model_path,
             Some(exec.clone()),
@@ -234,6 +277,7 @@ impl MultitalkerASR {
         let mel_basis = crate::audio::create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE);
         let mut config = MultitalkerConfig::default();
         config.max_speakers = sortformer.num_speakers();
+        let n_spk = sortformer.num_speakers();
 
         Ok(Self {
             model,
@@ -241,10 +285,13 @@ impl MultitalkerASR {
             vocab,
             speakers: Vec::new(),
             config,
+            vocab_size,
+            blank_id,
             mel_basis,
             audio_buffer: Vec::new(),
             audio_processed: 0,
             chunk_idx: 0,
+            diar_queue: Array2::zeros((0, n_spk)),
         })
     }
 
@@ -255,6 +302,13 @@ impl MultitalkerASR {
         self.audio_buffer.clear();
         self.audio_processed = 0;
         self.chunk_idx = 0;
+        self.diar_queue = Array2::zeros((0, self.sortformer.num_speakers()));
+    }
+
+    /// Sortformer ONNX runs since the last [`reset`](Self::reset).
+    #[doc(hidden)]
+    pub fn sortformer_session_runs(&self) -> u64 {
+        self.sortformer.session_runs()
     }
 
     /// Returns the current multitalker configuration.
@@ -292,6 +346,17 @@ impl MultitalkerASR {
         }
     }
 
+    /// Set how ASR chunks obtain Sortformer frames.
+    ///
+    /// Changing the strategy clears streaming state, including Sortformer
+    /// caches and any queued diarization frames.
+    pub fn set_diar_strategy(&mut self, strategy: DiarStrategy) {
+        if self.config.diar_strategy != strategy {
+            self.config.diar_strategy = strategy;
+            self.reset();
+        }
+    }
+
     /// Returns the number of audio samples the caller should provide per
     /// chunk for the current latency mode. This is `chunk_mel_frames * HOP_LENGTH`.
     pub fn chunk_audio_samples(&self) -> usize {
@@ -306,7 +371,7 @@ impl MultitalkerASR {
                 let valid_ids: Vec<usize> = spk
                     .accumulated_tokens
                     .iter()
-                    .filter(|&&(t, _)| t < VOCAB_SIZE)
+                    .filter(|&&(t, _)| t < self.vocab_size)
                     .map(|&(t, _)| t)
                     .collect();
                 let words = self.tokens_to_words(&spk.accumulated_tokens);
@@ -326,67 +391,152 @@ impl MultitalkerASR {
     pub fn transcribe_chunk(&mut self, audio_chunk: &[f32]) -> Result<Vec<SpeakerTranscript>> {
         self.audio_buffer.extend_from_slice(audio_chunk);
 
-        let total_audio = self.audio_buffer.len();
-        if total_audio < WIN_LENGTH {
-            return Ok(vec![]);
+        if self.config.diar_strategy == DiarStrategy::Buffered {
+            let frames = self.sortformer.feed_raw(audio_chunk)?;
+            self.push_diar_frames(frames);
+            return self.emit_buffered_chunks(false);
         }
 
-        // Compute mel over full buffer
-        let full_mel = self.compute_mel_spectrogram(&self.audio_buffer)?;
-        let total_mel_frames = full_mel.shape()[1];
+        self.emit_per_chunk(audio_chunk)
+    }
 
-        let processed_mel_frames = self.audio_processed / HOP_LENGTH;
-        let chunk_size = self.config.chunk_size();
-        let available_new_frames = total_mel_frames.saturating_sub(processed_mel_frames);
-        if available_new_frames < chunk_size {
-            return Ok(vec![]);
+    /// Finish a [`DiarStrategy::Buffered`] stream.
+    ///
+    /// Runs `Sortformer::flush_raw` and transcribes ASR chunks that were held
+    /// until those 80 ms frames existed. [`DiarStrategy::PerChunk`] already
+    /// diarized every chunk, so this returns an empty vec.
+    pub fn flush(&mut self) -> Result<Vec<SpeakerTranscript>> {
+        if self.config.diar_strategy != DiarStrategy::Buffered {
+            return Ok(Vec::new());
         }
+        let frames = self.sortformer.flush_raw()?;
+        self.push_diar_frames(frames);
+        self.emit_buffered_chunks(true)
+    }
 
-        // Get raw diarisation predictions from Sortformer.
-        // NOTE: The ASR chunk (~1.12s in Normal mode) is smaller than Sortformer's
-        // internal stride (~10s). Sortformer pads the short input internally. A future
-        // improvement would decouple the two chunk rates: buffer audio for Sortformer
-        // and run ASR sub-chunks against the resulting predictions.
+    /// Per-chunk Sortformer path. One ASR chunk per call, matching the
+    /// historical `diarize_chunk_raw(audio_chunk)` behavior.
+    fn emit_per_chunk(&mut self, audio_chunk: &[f32]) -> Result<Vec<SpeakerTranscript>> {
+        let Some(full_mel) = self.ready_mel()? else {
+            return Ok(Vec::new());
+        };
         let raw_preds = self.sortformer.diarize_chunk_raw(audio_chunk)?;
-        let diar_preds = &raw_preds.predictions;
+        self.consume_asr_chunk(&full_mel, &raw_preds.predictions, None)
+    }
 
-        // Determine active speakers
-        let mut active_speakers = Vec::new();
-        for spk_id in 0..self.config.max_speakers {
-            if spk_id >= diar_preds.ncols() {
+    /// Transcribe every buffered ASR chunk whose Sortformer frames are ready.
+    ///
+    /// `end_of_stream` accepts a short final slice (and, if the queue ends
+    /// exactly on a chunk boundary, repeats the last frame) so the tail still
+    /// reaches the encoder after `flush_raw`.
+    fn emit_buffered_chunks(&mut self, end_of_stream: bool) -> Result<Vec<SpeakerTranscript>> {
+        let mut results = Vec::new();
+        let frames_per = sortformer_frames_per_asr_chunk(self.config.chunk_size());
+        loop {
+            let Some(full_mel) = self.ready_mel()? else {
                 break;
-            }
-            let max_activity = (0..diar_preds.nrows())
-                .map(|t| diar_preds[[t, spk_id]])
-                .fold(0.0f32, f32::max);
-            if max_activity > self.config.activity_threshold {
-                active_speakers.push(spk_id);
-            }
+            };
+            let queued = if end_of_stream {
+                diar_frames_for_asr_chunk_final(&self.diar_queue, self.chunk_idx, frames_per)
+            } else {
+                diar_frames_for_asr_chunk(&self.diar_queue, self.chunk_idx, frames_per)
+                    .map(|view| view.to_owned())
+            };
+            let Some(preds) = queued else {
+                break;
+            };
+            // The encoder keeps only the tail of a stretched mask, so a stable
+            // turn matches PerChunk tokenization. A turn change or a chunk that
+            // ends in silence would hide the earlier speaker; those chunks
+            // spread one Sortformer frame across each kept mask slot.
+            let threshold = self.config.activity_threshold;
+            let spread = trailing_rows_inactive(&preds, threshold)
+                || speaker_changes_within(&preds, threshold);
+            let kept = if spread {
+                Some(self.config.latency_mode.encoded_frames())
+            } else {
+                None
+            };
+            results.extend(self.consume_asr_chunk(&full_mel, &preds, kept)?);
         }
+        Ok(results)
+    }
 
-        // Ensure speaker instances exist
+    /// Mel for the current buffer when at least one ASR chunk of new frames is waiting.
+    fn ready_mel(&self) -> Result<Option<Array2<f32>>> {
+        if self.audio_buffer.len() < WIN_LENGTH {
+            return Ok(None);
+        }
+        let full_mel = self.compute_mel_spectrogram(&self.audio_buffer)?;
+        let processed_mel_frames = self.audio_processed / HOP_LENGTH;
+        let available_new_frames = full_mel.shape()[1].saturating_sub(processed_mel_frames);
+        if available_new_frames < self.config.chunk_size() {
+            Ok(None)
+        } else {
+            Ok(Some(full_mel))
+        }
+    }
+
+    fn push_diar_frames(&mut self, frames: Array2<f32>) {
+        if frames.nrows() == 0 {
+            return;
+        }
+        if self.diar_queue.nrows() == 0 {
+            self.diar_queue = frames;
+            return;
+        }
+        if frames.ncols() != self.diar_queue.ncols() {
+            return;
+        }
+        self.diar_queue =
+            ndarray::concatenate(Axis(0), &[self.diar_queue.view(), frames.view()]).unwrap();
+    }
+
+    /// Encode and decode one ASR chunk using `diar_preds` (rows are 80 ms frames).
+    ///
+    /// `kept_tail` is set for [`DiarStrategy::Buffered`]. The encoder graph slices
+    /// `spk_targets` to its last `encoded_frames` entries (the pre-encode length),
+    /// so those slots receive one Sortformer frame each. [`DiarStrategy::PerChunk`]
+    /// passes `None` and keeps the historical stretch across the whole vector.
+    fn consume_asr_chunk(
+        &mut self,
+        full_mel: &Array2<f32>,
+        diar_preds: &Array2<f32>,
+        kept_tail: Option<usize>,
+    ) -> Result<Vec<SpeakerTranscript>> {
+        let chunk_size = self.config.chunk_size();
+        let processed_mel_frames = self.audio_processed / HOP_LENGTH;
+        let active_speakers = active_speaker_ids(
+            diar_preds,
+            self.config.max_speakers,
+            self.config.activity_threshold,
+        );
+
         for &spk_id in &active_speakers {
             if !self.speakers.iter().any(|s| s.speaker_id == spk_id) {
-                self.speakers.push(SpeakerInstance::new(spk_id));
+                self.speakers
+                    .push(SpeakerInstance::new(spk_id, self.blank_id));
             }
         }
 
-        // Build encoder input chunk
         let expected_size = PRE_ENCODE_CACHE + chunk_size;
         let is_first_chunk = self.chunk_idx == 0;
         let main_start = processed_mel_frames;
 
-        let mel_chunk = self.build_mel_chunk(&full_mel, main_start, is_first_chunk, expected_size)?;
+        let mel_chunk =
+            self.build_mel_chunk(full_mel, main_start, is_first_chunk, expected_size)?;
         let chunk_length = expected_size;
 
         let chunk_frame_offset = self.chunk_idx * self.config.latency_mode.encoded_frames();
         let mut results = Vec::new();
 
-        // For each active speaker, run encoder with speaker-specific masks
         for &spk_id in &active_speakers {
-            // Derive spk_targets and bg_spk_targets from raw predictions
-            let (spk_targets, bg_spk_targets) =
-                self.derive_speaker_targets(diar_preds, spk_id, chunk_length)?;
+            let (spk_targets, bg_spk_targets) = match kept_tail {
+                Some(kept) => {
+                    Self::derive_speaker_targets_kept(diar_preds, spk_id, chunk_length, kept)?
+                }
+                None => Self::derive_speaker_targets(diar_preds, spk_id, chunk_length)?,
+            };
 
             let spk_idx = self
                 .speakers
@@ -394,7 +544,6 @@ impl MultitalkerASR {
                 .position(|s| s.speaker_id == spk_id)
                 .unwrap();
 
-            // Run encoder with this speaker's targets and cache
             let (encoded, enc_len, new_cache) = self.model.run_encoder(
                 &mel_chunk,
                 chunk_length as i64,
@@ -404,7 +553,6 @@ impl MultitalkerASR {
             )?;
             self.speakers[spk_idx].encoder_cache = new_cache;
 
-            // Decode tokens for this speaker
             let tokens = self.decode_chunk_for_speaker(
                 spk_idx,
                 &encoded,
@@ -413,10 +561,9 @@ impl MultitalkerASR {
             )?;
             self.speakers[spk_idx].accumulated_tokens.extend(&tokens);
 
-            // Build text delta and word timestamps for this chunk's tokens
             let mut text = String::new();
             for &(t, _) in &tokens {
-                if t < VOCAB_SIZE {
+                if t < self.vocab_size {
                     text.push_str(&self.vocab.decode_single(t));
                 }
             }
@@ -431,11 +578,9 @@ impl MultitalkerASR {
             }
         }
 
-        // Advance processed position
         self.audio_processed += chunk_size * HOP_LENGTH;
         self.chunk_idx += 1;
 
-        // Trim audio buffer
         let keep_samples = (PRE_ENCODE_CACHE + chunk_size) * HOP_LENGTH + WIN_LENGTH;
         if self.audio_buffer.len() > keep_samples * 2 {
             let remove = self.audio_buffer.len() - keep_samples;
@@ -492,11 +637,12 @@ impl MultitalkerASR {
             self.transcribe_chunk(&chunk_vec)?;
         }
 
-        // Flush with silence
+        // Flush with silence, then (Buffered only) the Sortformer tail.
         let flush_chunk = vec![0.0f32; audio_chunk_size];
         for _ in 0..3 {
             self.transcribe_chunk(&flush_chunk)?;
         }
+        self.flush()?;
 
         Ok(self.get_transcripts())
     }
@@ -509,7 +655,6 @@ impl MultitalkerASR {
     ///
     /// The masks are resized/interpolated to match the encoder's time dimension.
     fn derive_speaker_targets(
-        &self,
         diar_preds: &Array2<f32>,
         speaker_id: usize,
         encoder_time: usize,
@@ -547,6 +692,60 @@ impl MultitalkerASR {
         let bg_spk_targets = Array2::from_shape_vec((1, encoder_time), bg_vals)
             .map_err(|e| Error::Model(format!("bg_spk_targets shape mismatch: {e}")))?;
 
+        Ok((spk_targets, bg_spk_targets))
+    }
+
+    /// Place one Sortformer frame in each mask slot the encoder keeps.
+    ///
+    /// The multitalker graph slices `spk_targets` / `bg_spk_targets` with a
+    /// negative start on the time axis, so only the last `kept` values are
+    /// multiplied into the pre-encoded sequence (`kept` equals
+    /// [`LatencyMode::encoded_frames`]). Values before that tail are unused.
+    fn derive_speaker_targets_kept(
+        diar_preds: &Array2<f32>,
+        speaker_id: usize,
+        encoder_time: usize,
+        kept: usize,
+    ) -> Result<(Array2<f32>, Array2<f32>)> {
+        let kept = kept.max(1).min(encoder_time.max(1));
+        let tail_start = encoder_time.saturating_sub(kept);
+        let diar_frames = diar_preds.nrows();
+        // The graph reads one mask value per pre-encoded frame. Sample the
+        // chunk's Sortformer rows uniformly into those slots (not only the
+        // last 140 ms, which drops words when a chunk ends in silence).
+        let mut spk_vals = Vec::with_capacity(encoder_time);
+        let mut bg_vals = Vec::with_capacity(encoder_time);
+
+        for enc_t in 0..encoder_time {
+            if enc_t < tail_start {
+                spk_vals.push(0.0);
+                bg_vals.push(0.0);
+                continue;
+            }
+            let slot = enc_t - tail_start;
+            let diar_t = if diar_frames == 0 {
+                0
+            } else {
+                (slot * diar_frames / kept).min(diar_frames - 1)
+            };
+            if diar_t < diar_frames && speaker_id < diar_preds.ncols() {
+                let spk_val = diar_preds[[diar_t, speaker_id]];
+                let bg_val = (0..diar_preds.ncols())
+                    .filter(|&j| j != speaker_id)
+                    .map(|j| diar_preds[[diar_t, j]])
+                    .fold(0.0f32, f32::max);
+                spk_vals.push(spk_val);
+                bg_vals.push(bg_val);
+            } else {
+                spk_vals.push(1.0);
+                bg_vals.push(0.0);
+            }
+        }
+
+        let spk_targets = Array2::from_shape_vec((1, encoder_time), spk_vals)
+            .map_err(|e| Error::Model(format!("spk_targets shape mismatch: {e}")))?;
+        let bg_spk_targets = Array2::from_shape_vec((1, encoder_time), bg_vals)
+            .map_err(|e| Error::Model(format!("bg_spk_targets shape mismatch: {e}")))?;
         Ok((spk_targets, bg_spk_targets))
     }
 
@@ -620,7 +819,7 @@ impl MultitalkerASR {
 
                 let (max_idx, _) = crate::tensor_utils::argmax_f32_iter(logits.iter().copied());
 
-                if max_idx == BLANK_ID {
+                if max_idx == self.blank_id {
                     break;
                 }
 
@@ -638,7 +837,7 @@ impl MultitalkerASR {
     fn tokens_to_words(&self, tokens: &[(usize, usize)]) -> Vec<WordTimestamp> {
         let timed: Vec<TimedToken> = tokens
             .iter()
-            .filter(|(id, _)| *id < VOCAB_SIZE)
+            .filter(|(id, _)| *id < self.vocab_size)
             .map(|&(id, frame)| TimedToken {
                 text: self.vocab.decode_single(id),
                 start: frame as f32 * SECONDS_PER_ENCODED_FRAME,
@@ -668,6 +867,131 @@ impl MultitalkerASR {
 
         Ok(mel.mapv(|x| (x.max(0.0) + LOG_ZERO_GUARD).ln()))
     }
+}
+
+/// SentencePiece size plus the joint-network class count.
+///
+/// Success is `decoder_classes == tokenizer_size + 1` (blank is the extra class).
+/// When the joint dimension is missing, blank is `tokenizer_size` for a non-empty
+/// tokenizer. Any other combination returns the historical `(1024, 1024)` pair.
+pub(crate) fn token_layout(
+    tokenizer_size: usize,
+    decoder_classes: Option<usize>,
+) -> (usize, usize) {
+    match decoder_classes {
+        Some(classes) if tokenizer_size > 0 && classes == tokenizer_size + 1 => {
+            (tokenizer_size, classes - 1)
+        }
+        None if tokenizer_size > 0 => (tokenizer_size, tokenizer_size),
+        _ => (FALLBACK_VOCAB_SIZE, FALLBACK_BLANK_ID),
+    }
+}
+
+/// Sortformer frames (80 ms) covered by one ASR chunk of `chunk_mel_frames` (10 ms hop).
+pub(crate) fn sortformer_frames_per_asr_chunk(chunk_mel_frames: usize) -> usize {
+    chunk_mel_frames / MEL_FRAMES_PER_DIAR_FRAME
+}
+
+/// Rows `[chunk_index * frames_per_chunk, (chunk_index + 1) * frames_per_chunk)`
+/// of `queued`, or `None` when the last row is not queued yet.
+pub(crate) fn diar_frames_for_asr_chunk<'a>(
+    queued: &'a Array2<f32>,
+    chunk_index: usize,
+    frames_per_chunk: usize,
+) -> Option<ArrayView2<'a, f32>> {
+    if frames_per_chunk == 0 {
+        return None;
+    }
+    let start = chunk_index.checked_mul(frames_per_chunk)?;
+    let end = start.checked_add(frames_per_chunk)?;
+    if queued.nrows() < end {
+        None
+    } else {
+        Some(queued.slice(s![start..end, ..]))
+    }
+}
+
+/// Like [`diar_frames_for_asr_chunk`], but at end of stream: a short tail is
+/// returned as-is, and chunks that start at or beyond the queue repeat the
+/// last queued frame so the encoder still steps.
+fn diar_frames_for_asr_chunk_final(
+    queued: &Array2<f32>,
+    chunk_index: usize,
+    frames_per_chunk: usize,
+) -> Option<Array2<f32>> {
+    if let Some(view) = diar_frames_for_asr_chunk(queued, chunk_index, frames_per_chunk) {
+        return Some(view.to_owned());
+    }
+    if frames_per_chunk == 0 || queued.ncols() == 0 {
+        return None;
+    }
+    let start = chunk_index.checked_mul(frames_per_chunk)?;
+    if queued.nrows() > start {
+        return Some(queued.slice(s![start.., ..]).to_owned());
+    }
+    if queued.nrows() == 0 {
+        return None;
+    }
+    let last = queued.row(queued.nrows() - 1);
+    let ncols = queued.ncols();
+    Some(Array2::from_shape_fn(
+        (frames_per_chunk, ncols),
+        |(_, c)| last[c],
+    ))
+}
+
+/// True when every speaker is at or below `threshold` on the last two rows
+/// (or the only row). Those rows are what a stretched mask leaves in the
+/// encoder's kept tail.
+fn trailing_rows_inactive(frames: &Array2<f32>, threshold: f32) -> bool {
+    let n = frames.nrows();
+    if n == 0 {
+        return true;
+    }
+    let start = n.saturating_sub(2);
+    (start..n).all(|t| (0..frames.ncols()).all(|s| frames[[t, s]] <= threshold))
+}
+
+/// True when the loudest speaker above `threshold` is not the same on every
+/// active row. A stretched mask would give the whole chunk to whoever is last.
+fn speaker_changes_within(frames: &Array2<f32>, threshold: f32) -> bool {
+    let mut seen: Option<usize> = None;
+    for t in 0..frames.nrows() {
+        let mut best: Option<(usize, f32)> = None;
+        for s in 0..frames.ncols() {
+            let v = frames[[t, s]];
+            if best.is_none_or(|(_, b)| v > b) {
+                best = Some((s, v));
+            }
+        }
+        if let Some((s, v)) = best
+            && v > threshold
+        {
+            match seen {
+                None => seen = Some(s),
+                Some(prev) if prev != s => return true,
+                Some(_) => {}
+            }
+        }
+    }
+    false
+}
+
+/// Speaker columns whose max probability in `diar_preds` exceeds `threshold`.
+fn active_speaker_ids(diar_preds: &Array2<f32>, max_speakers: usize, threshold: f32) -> Vec<usize> {
+    let mut active = Vec::new();
+    for spk_id in 0..max_speakers {
+        if spk_id >= diar_preds.ncols() {
+            break;
+        }
+        let max_activity = (0..diar_preds.nrows())
+            .map(|t| diar_preds[[t, spk_id]])
+            .fold(0.0f32, f32::max);
+        if max_activity > threshold {
+            active.push(spk_id);
+        }
+    }
+    active
 }
 
 /// Implement the Transcriber trait for single-speaker fallback.
@@ -711,7 +1035,7 @@ impl Transcriber for MultitalkerASR {
         }
 
         // Create a single speaker instance
-        self.speakers.push(SpeakerInstance::new(0));
+        self.speakers.push(SpeakerInstance::new(0, self.blank_id));
 
         let chunk_size = self.config.chunk_size();
         let mut buffer_idx = 0;
@@ -738,8 +1062,7 @@ impl Transcriber for MultitalkerASR {
             )?;
             self.speakers[0].encoder_cache = new_cache;
 
-            let chunk_frame_offset =
-                chunk_idx * self.config.latency_mode.encoded_frames();
+            let chunk_frame_offset = chunk_idx * self.config.latency_mode.encoded_frames();
             let tokens =
                 self.decode_chunk_for_speaker(0, &encoded, enc_len as usize, chunk_frame_offset)?;
             self.speakers[0].accumulated_tokens.extend(tokens);
@@ -751,7 +1074,7 @@ impl Transcriber for MultitalkerASR {
         let valid_ids: Vec<usize> = self.speakers[0]
             .accumulated_tokens
             .iter()
-            .filter(|&&(t, _)| t < VOCAB_SIZE)
+            .filter(|&&(t, _)| t < self.vocab_size)
             .map(|&(t, _)| t)
             .collect();
 
@@ -761,5 +1084,121 @@ impl Transcriber for MultitalkerASR {
             text,
             tokens: Vec::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preds(rows: &[[f32; 3]]) -> Array2<f32> {
+        let mut arr = Array2::zeros((rows.len(), 3));
+        for (t, row) in rows.iter().enumerate() {
+            for (s, value) in row.iter().enumerate() {
+                arr[[t, s]] = *value;
+            }
+        }
+        arr
+    }
+
+    #[test]
+    fn token_layout_matches_current_model_and_falls_back() {
+        assert_eq!(token_layout(1024, Some(1025)), (1024, 1024));
+        assert_eq!(token_layout(1024, None), (1024, 1024));
+        assert_eq!(token_layout(2048, Some(2049)), (2048, 2048));
+        assert_eq!(
+            token_layout(0, None),
+            (FALLBACK_VOCAB_SIZE, FALLBACK_BLANK_ID)
+        );
+        assert_eq!(
+            token_layout(100, Some(1025)),
+            (FALLBACK_VOCAB_SIZE, FALLBACK_BLANK_ID)
+        );
+        assert_eq!(
+            token_layout(1024, Some(1024)),
+            (FALLBACK_VOCAB_SIZE, FALLBACK_BLANK_ID)
+        );
+    }
+
+    #[test]
+    fn derive_speaker_targets_shape_background_and_nearest() {
+        let diar = preds(&[
+            [0.1, 0.2, 0.0],
+            [0.4, 0.9, 0.3],
+            [0.0, 0.2, 0.8],
+            [0.5, 0.1, 0.1],
+        ]);
+        let (spk, bg) = MultitalkerASR::derive_speaker_targets(&diar, 1, 4).unwrap();
+        assert_eq!(spk.shape(), &[1, 4]);
+        assert_eq!(bg.shape(), &[1, 4]);
+        // encoder_time == diar rows, so each step copies that row.
+        assert_eq!(spk.row(0).to_vec(), vec![0.2, 0.9, 0.2, 0.1]);
+        // Background is the max of the other speakers on the same row.
+        assert_eq!(bg.row(0).to_vec(), vec![0.1, 0.4, 0.8, 0.5]);
+
+        let (narrow, _) = MultitalkerASR::derive_speaker_targets(&diar, 1, 2).unwrap();
+        // enc 0 -> diar 0; enc 1 -> 1 * 4 / 2 = 2.
+        assert_eq!(narrow.row(0).to_vec(), vec![0.2, 0.2]);
+
+        let (kept, kept_bg) = MultitalkerASR::derive_speaker_targets_kept(&diar, 1, 10, 4).unwrap();
+        assert_eq!(kept.shape(), &[1, 10]);
+        let kept_row = kept.row(0).to_vec();
+        let kept_bg_row = kept_bg.row(0).to_vec();
+        assert_eq!(&kept_row[..6], &[0.0; 6]);
+        assert_eq!(&kept_row[6..], &[0.2, 0.9, 0.2, 0.1]);
+        assert_eq!(&kept_bg_row[6..], &[0.1, 0.4, 0.8, 0.5]);
+
+        let (fallback_spk, fallback_bg) =
+            MultitalkerASR::derive_speaker_targets(&diar, 9, 3).unwrap();
+        assert_eq!(fallback_spk.row(0).to_vec(), vec![1.0, 1.0, 1.0]);
+        assert_eq!(fallback_bg.row(0).to_vec(), vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn trailing_silence_selects_spread_mask() {
+        let speech = preds(&[[0.9, 0.0, 0.0], [0.8, 0.0, 0.0]]);
+        assert!(!trailing_rows_inactive(&speech, 0.3));
+        let ended = preds(&[[0.9, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.05, 0.0]]);
+        assert!(trailing_rows_inactive(&ended, 0.3));
+        let handover = preds(&[[0.9, 0.1, 0.0], [0.1, 0.8, 0.0]]);
+        assert!(speaker_changes_within(&handover, 0.3));
+        assert!(!speaker_changes_within(&speech, 0.3));
+    }
+
+    #[test]
+    fn active_speakers_respect_threshold() {
+        let diar = preds(&[[0.2, 0.31, 0.29], [0.0, 0.1, 0.0]]);
+        assert_eq!(active_speaker_ids(&diar, 4, 0.3), vec![1]);
+        assert!(active_speaker_ids(&diar, 4, 0.95).is_empty());
+        assert!(active_speaker_ids(&diar, 0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn diar_frames_for_chunk_waits_until_covered() {
+        let queued = preds(&[
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]);
+        assert!(diar_frames_for_asr_chunk(&queued, 0, 0).is_none());
+        assert!(diar_frames_for_asr_chunk(&queued, 1, 4).is_none());
+        let chunk0 = diar_frames_for_asr_chunk(&queued, 0, 2).unwrap();
+        assert_eq!(chunk0.shape(), &[2, 3]);
+        assert_eq!(chunk0[[0, 0]], 1.0);
+        assert_eq!(chunk0[[1, 0]], 1.0);
+        let chunk1 = diar_frames_for_asr_chunk(&queued, 1, 2).unwrap();
+        assert_eq!(chunk1[[0, 1]], 1.0);
+        assert_eq!(chunk1[[1, 1]], 1.0);
+        // Normal latency: 112 mel frames / 8 = 14 Sortformer frames.
+        assert_eq!(
+            sortformer_frames_per_asr_chunk(LatencyMode::Normal.chunk_mel_frames()),
+            14
+        );
+        assert_eq!(
+            sortformer_frames_per_asr_chunk(LatencyMode::Ultra.chunk_mel_frames()),
+            1
+        );
     }
 }

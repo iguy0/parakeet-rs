@@ -133,7 +133,9 @@ impl NemotronModel {
                 has_prompt = true;
                 continue;
             }
-            let ValueType::Tensor { shape, .. } = outlet.dtype() else { continue };
+            let ValueType::Tensor { shape, .. } = outlet.dtype() else {
+                continue;
+            };
             let dims: &[i64] = shape;
             match name {
                 "cache_last_channel" if dims.len() == 4 => {

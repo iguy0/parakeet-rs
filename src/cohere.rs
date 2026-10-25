@@ -21,14 +21,17 @@
 //!     ./cohere-onnx
 //! ```
 //!
-//! No custom export script is needed - the `cohere_asr` model type is
-//! supported by Optimum's standard exporter.
+//! No custom export script is needed for the merged graph - the `cohere_asr`
+//! model type is supported by Optimum's standard exporter. An optional
+//! steady-state decoder (`decoder_model_steady[_quantized].onnx`, produced
+//! by `scripts/export_cohere_steady_decoder.py`) skips the first-step `If`
+//! on later tokens. It is used automatically when the file is present.
 
-use crate::audio::{extract_features_with_cache, FeatureCache};
+use crate::audio::{FeatureCache, extract_features_with_cache};
 use crate::config::PreprocessorConfig;
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
-use crate::model_cohere::{CohereEncoderOutput, CohereModel, CoherePastKv, N_MELS};
+use crate::model_cohere::{CohereEncoderOutput, CohereModel, N_MELS};
 use ndarray::{Array2, Axis};
 use std::collections::HashMap;
 use std::path::Path;
@@ -70,10 +73,10 @@ const MAX_DECODE_TOKENS_LIMIT: usize = 1024;
 const DEFAULT_MAX_DECODE_TOKENS: usize = 512;
 
 /// Training chunk length recorded in `preprocessor_config.json`
-/// (`max_audio_clip_s`). This is *not* a runtime limit — the official model
-/// card lists long-form transcription as a supported feature and audio well
-/// past this length transcribes fine. Exposed via
-/// [`CohereASR::training_chunk_secs`] only as informational metadata :-)
+/// (`max_audio_clip_s`). Vendor docs also set `overlap_chunk_second = 5`,
+/// and positional embeddings cap the encoder at about 5000 frames. Audio
+/// longer than this is not guaranteed to transcribe; use
+/// [`CohereASR::transcribe_audio_long`].
 const TRAINING_CHUNK_SECS: f32 = 35.0;
 
 // The 14 languages officially supported by Cohere Transcribe
@@ -83,7 +86,6 @@ const TRAINING_CHUNK_SECS: f32 = 35.0;
 const SUPPORTED_LANGUAGES: &[&str] = &[
     "ar", "de", "el", "en", "es", "fr", "it", "ja", "ko", "nl", "pl", "pt", "vi", "zh",
 ];
-
 
 struct DecoderTokens {
     decoder_start: i64,
@@ -152,6 +154,9 @@ pub struct CohereASR {
     /// Defaults to [`DEFAULT_MAX_DECODE_TOKENS`] (512). Capped at
     /// [`MAX_DECODE_TOKENS_LIMIT`] (1024).
     max_decode_tokens: usize,
+    /// Window length used by [`Self::transcribe_audio_long`].
+    /// Defaults to [`TRAINING_CHUNK_SECS`].
+    max_chunk_secs: f32,
 }
 
 impl CohereASR {
@@ -161,6 +166,11 @@ impl CohereASR {
     /// - one of `encoder_model[_quantized|_fp16].onnx` (+ `.onnx_data` companions)
     /// - one of `decoder_model_merged[_quantized|_fp16].onnx` (+ `.onnx_data`)
     /// - `tokenizer.json`
+    ///
+    /// Optional, same flat or `onnx/` layout:
+    /// `decoder_model_steady.onnx` or `decoder_model_steady_quantized.onnx`.
+    /// When present, decode steps after the first use that graph. Disable
+    /// with [`Self::set_use_steady_decoder`].
     ///
     /// parameters are hardcoded since they are fixed by the encoder graph.
     ///
@@ -210,15 +220,30 @@ impl CohereASR {
             lang_tokens,
             tokens,
             max_decode_tokens: DEFAULT_MAX_DECODE_TOKENS,
+            max_chunk_secs: TRAINING_CHUNK_SECS,
         })
     }
 
     /// Training chunk length (in seconds) recorded in the upstream
-    /// `preprocessor_config.json`. Exposed as metadata only — the model
-    /// card lists long-form transcription as supported and audio longer
-    /// than this transcribes fine in practice.
+    /// `preprocessor_config.json` (`max_audio_clip_s`). Audio past this
+    /// length is not guaranteed; [`Self::transcribe_audio_long`] splits
+    /// on that window.
     pub fn training_chunk_secs(&self) -> f32 {
         TRAINING_CHUNK_SECS
+    }
+
+    /// Window length, in seconds, used by [`Self::transcribe_audio_long`].
+    pub fn max_chunk_secs(&self) -> f32 {
+        self.max_chunk_secs
+    }
+
+    /// Set the window length used by [`Self::transcribe_audio_long`].
+    ///
+    /// The default is [`Self::training_chunk_secs`] (35). Values that are
+    /// not finite or not positive make `transcribe_audio_long` return
+    /// [`Error::Config`].
+    pub fn set_max_chunk_secs(&mut self, secs: f32) {
+        self.max_chunk_secs = secs;
     }
 
     /// Current maximum number of tokens the decoder will emit per call.
@@ -232,6 +257,39 @@ impl CohereASR {
         self.max_decode_tokens = max.clamp(1, MAX_DECODE_TOKENS_LIMIT);
     }
 
+    /// Record per-step decoder durations for the next transcription.
+    ///
+    /// Default is off. Enabling clears any samples already stored. Read them
+    /// with [`Self::decoder_step_millis`] after `transcribe_audio`.
+    pub fn set_record_decoder_steps(&mut self, enabled: bool) {
+        self.model.set_record_steps(enabled);
+    }
+
+    /// Milliseconds spent inside each decoder step of the last recorded call.
+    pub fn decoder_step_millis(&self) -> &[f64] {
+        self.model.step_millis()
+    }
+
+    /// Parallel to [`Self::decoder_step_millis`]: true when that step ran the
+    /// steady-state decoder graph.
+    pub fn decoder_step_used_steady(&self) -> &[bool] {
+        self.model.step_used_steady()
+    }
+
+    /// Use the steady-state decoder for steps after the first.
+    ///
+    /// Default is on when `decoder_model_steady[_quantized].onnx` was found
+    /// at load. Passing `false` forces the merged graph for every step.
+    /// Passing `true` does nothing when that file was not loaded.
+    pub fn set_use_steady_decoder(&mut self, enabled: bool) {
+        self.model.set_use_steady_decoder(enabled);
+    }
+
+    /// Whether a steady-state decoder graph was loaded.
+    pub fn steady_decoder_loaded(&self) -> bool {
+        self.model.steady_decoder_loaded()
+    }
+
     /// Transcribe raw 16 kHz mono f32 audio samples.
     ///
     /// `language` is an ISO 639-1 code (e.g. `"en"`, `"fr"`, `"de"`, `"ja"`).
@@ -242,14 +300,11 @@ impl CohereASR {
     /// # Long-form audio
     ///
     /// The model was trained on clips up to 35 s ([`Self::training_chunk_secs`]).
-    /// Longer audio still runs but quality drifts past that range. For
-    /// long-form transcription split the waveform into <=35 s chunks
-    /// yourself and call this method once per chunk. The reference
-    /// implementation in [`nano-cohere-transcribe`](https://github.com/Deep-unlearning/nano-cohere-transcribe/blob/main/nano_cohere_transcribe/chunk.py)
-    /// splits at the quietest point in the last 5 s of each 35 s window
-    /// and joins per-chunk text with `""` for `ja`/`zh` and `" "` for
-    /// every other language. parakeet-rs deliberately leaves the
-    /// chunking policy to the caller.
+    /// The Hugging Face model card sets `max_audio_clip_s = 35` and
+    /// `overlap_chunk_second = 5`, and positional embeddings cover about
+    /// 5000 encoder frames. Audio longer than about 35 s is not guaranteed
+    /// to transcribe correctly. Use [`Self::transcribe_audio_long`] for
+    /// longer clips.
     pub fn transcribe_audio(
         &mut self,
         audio: &[f32],
@@ -332,6 +387,34 @@ impl CohereASR {
         Ok(cleaned)
     }
 
+    /// Transcribe audio that may be longer than [`Self::max_chunk_secs`].
+    ///
+    /// Each window is at most `max_chunk_secs` (default 35). The cut is the
+    /// quietest 100 ms frame in the last 5 s of the window. Chunk texts are
+    /// joined with `""` for `ja` and `zh`, and with a single space otherwise.
+    pub fn transcribe_audio_long(
+        &mut self,
+        audio: &[f32],
+        language: &str,
+        punctuation: bool,
+        itn: bool,
+    ) -> Result<String> {
+        if audio.is_empty() {
+            return Ok(String::new());
+        }
+        let sample_rate = self.preprocessor.sampling_rate as u32;
+        let max_samples = chunk_sample_limit(self.max_chunk_secs, sample_rate)?;
+        let ranges = chunk_ranges(audio, max_samples, sample_rate);
+        let mut parts = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            let text = self.transcribe_audio(&audio[start..end], language, punctuation, itn)?;
+            if !text.is_empty() {
+                parts.push(text);
+            }
+        }
+        Ok(join_chunk_texts(language, &parts))
+    }
+
     /// Greedy autoregressive decode using the merged decoder's growing
     /// `past_key_values` cache. The first call feeds the prompt and lets
     /// the model populate the cross-attention encoder cache; subsequent
@@ -341,7 +424,7 @@ impl CohereASR {
         prompt: &[i64],
         encoder_out: &CohereEncoderOutput,
     ) -> Result<Vec<i64>> {
-        let mut past_kv = CoherePastKv::empty();
+        let mut past_kv = self.model.empty_past();
         let mut output_tokens: Vec<i64> = Vec::new();
 
         // First step: feed entire prompt
@@ -349,7 +432,7 @@ impl CohereASR {
             .map_err(|e| Error::Model(format!("Prompt tensor shape error: {e}")))?;
         let (logits, new_past) =
             self.model
-                .run_decoder_step(&prompt_tensor, &past_kv, encoder_out)?;
+                .run_decoder_step(&prompt_tensor, past_kv, encoder_out)?;
         past_kv = new_past;
 
         let mut next_token = argmax(logits.as_slice().unwrap());
@@ -364,7 +447,7 @@ impl CohereASR {
                 .map_err(|e| Error::Model(format!("Token tensor shape error: {e}")))?;
             let (logits, new_past) =
                 self.model
-                    .run_decoder_step(&token_tensor, &past_kv, encoder_out)?;
+                    .run_decoder_step(&token_tensor, past_kv, encoder_out)?;
             past_kv = new_past;
 
             next_token = argmax(logits.as_slice().unwrap());
@@ -424,6 +507,58 @@ fn argmax(logits: &[f32]) -> i64 {
     crate::tensor_utils::argmax_f32(logits).0 as i64
 }
 
+fn chunk_sample_limit(max_chunk_secs: f32, sample_rate: u32) -> Result<usize> {
+    if !max_chunk_secs.is_finite() || max_chunk_secs <= 0.0 || sample_rate == 0 {
+        return Err(Error::Config(format!(
+            "max_chunk_secs must be a positive finite number, got {max_chunk_secs}"
+        )));
+    }
+    let samples = (max_chunk_secs * sample_rate as f32).round() as usize;
+    if samples == 0 {
+        return Err(Error::Config(
+            "max_chunk_secs covers 0 samples at the configured sample rate".into(),
+        ));
+    }
+    Ok(samples)
+}
+
+/// Half-open sample ranges covering `audio`. Every range is non-empty and
+/// at most `max_samples` long. Cuts inside a window use the quietest 100 ms
+/// frame in the last 5 s.
+fn chunk_ranges(audio: &[f32], max_samples: usize, sample_rate: u32) -> Vec<(usize, usize)> {
+    if audio.is_empty() || max_samples == 0 {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    while offset < audio.len() {
+        let remaining = &audio[offset..];
+        let mut end = crate::audio::split_at_quiet_point(remaining, max_samples, sample_rate);
+        if end == 0 || end > remaining.len() {
+            end = max_samples.min(remaining.len());
+        }
+        ranges.push((offset, offset + end));
+        offset += end;
+    }
+    ranges
+}
+
+fn chunk_separator(language: &str) -> &'static str {
+    match language {
+        "ja" | "zh" => "",
+        _ => " ",
+    }
+}
+
+fn join_chunk_texts(language: &str, parts: &[String]) -> String {
+    parts
+        .iter()
+        .filter(|part| !part.is_empty())
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(chunk_separator(language))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +590,46 @@ mod tests {
 
         // Too short to detect
         assert_eq!(find_ngram_repetition(&[1, 2, 1, 2], 4), None);
+    }
+
+    #[test]
+    fn split_chunks_cover_all_samples() {
+        let sample_rate = 16_000u32;
+        let max_samples = 40_000usize;
+        let total = 100_000usize;
+        let audio = vec![0.2f32; total];
+        let ranges = chunk_ranges(&audio, max_samples, sample_rate);
+        assert!(!ranges.is_empty());
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges.last().unwrap().1, total);
+        let mut cursor = 0usize;
+        for (start, end) in &ranges {
+            assert_eq!(*start, cursor);
+            assert!(*end > *start, "empty chunk");
+            assert!(end - start <= max_samples);
+            cursor = *end;
+        }
+        let (last_start, last_end) = *ranges.last().unwrap();
+        assert!(last_end > last_start);
+
+        let short = vec![0.1f32; 100];
+        let one = chunk_ranges(&short, max_samples, sample_rate);
+        assert_eq!(one, vec![(0, 100)]);
+        assert!(chunk_ranges(&[], max_samples, sample_rate).is_empty());
+    }
+
+    #[test]
+    fn join_policy_cjk_vs_latin() {
+        let parts = vec!["hello".to_string(), "world".to_string()];
+        assert_eq!(join_chunk_texts("ja", &parts), "helloworld");
+        assert_eq!(join_chunk_texts("zh", &parts), "helloworld");
+        assert_eq!(join_chunk_texts("en", &parts), "hello world");
+        assert_eq!(chunk_separator("ja"), "");
+        assert_eq!(chunk_separator("zh"), "");
+        assert_eq!(chunk_separator("en"), " ");
+        assert_eq!(
+            join_chunk_texts("en", &["a".to_string(), String::new(), "b".to_string()]),
+            "a b"
+        );
     }
 }

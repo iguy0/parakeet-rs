@@ -163,9 +163,7 @@ impl CtcConfig {
     ///
     /// Granite TurboCTC: 160 * 2 * 4 = 1280 samples (80 ms @ 16 kHz).
     pub fn logit_shift_samples(&self, hop_length: usize) -> usize {
-        hop_length.max(1)
-            * self.frontend.stack_factor.max(1)
-            * self.encoder_subsample.max(1)
+        hop_length.max(1) * self.frontend.stack_factor.max(1) * self.encoder_subsample.max(1)
     }
 
     /// Samples per logit frame, using in-graph subsample from metadata when
@@ -184,6 +182,24 @@ impl CtcConfig {
             self.encoder_subsample.max(1)
         };
         hop_length.max(1) * self.frontend.stack_factor.max(1) * subsample
+    }
+
+    /// Whether `encoder_subsample * stack_factor` fails to explain the observed
+    /// frames within one frame of integer rounding.
+    ///
+    /// `feature_frames` is the model-input time axis (already divided by
+    /// `stack_factor`). Unstacked mel frames are `feature_frames * stack_factor`
+    /// and should cover `logit_frames * stack_factor * encoder_subsample`.
+    pub fn logit_frame_ratio_disagrees(&self, feature_frames: usize, logit_frames: usize) -> bool {
+        if feature_frames == 0 || logit_frames == 0 {
+            return false;
+        }
+        let stack = self.frontend.stack_factor.max(1);
+        let sub = self.encoder_subsample.max(1);
+        let product = stack.saturating_mul(sub);
+        let mel_frames = feature_frames.saturating_mul(stack);
+        let predicted = mel_frames / product;
+        predicted.abs_diff(logit_frames) > 1
     }
 }
 
@@ -248,7 +264,10 @@ mod tests {
 
     #[test]
     fn from_metadata_empty_is_default() {
-        assert_eq!(CtcConfig::from_metadata(&HashMap::new()), CtcConfig::default());
+        assert_eq!(
+            CtcConfig::from_metadata(&HashMap::new()),
+            CtcConfig::default()
+        );
     }
 
     #[test]
@@ -272,10 +291,7 @@ mod tests {
         assert_eq!(cfg.frontend.stack_factor, 2);
         assert_eq!(cfg.encoder_subsample, 4);
         assert_eq!(cfg.logit_shift_samples(160), 1280);
-        assert_eq!(
-            cfg.logit_shift_samples_for(160, 200, 50),
-            1280
-        );
+        assert_eq!(cfg.logit_shift_samples_for(160, 200, 50), 1280);
         assert_eq!(
             cfg.frontend.normalization,
             NormalizationMode::DbFloorScale { floor_db: 8.0 }
@@ -286,9 +302,25 @@ mod tests {
     fn from_metadata_ignores_invalid_fields() {
         let mut keys = HashMap::new();
         keys.insert(CTC_META_BLANK_ID.to_string(), "not-a-number".into());
-        keys.insert(CTC_META_FRONTEND_NORMALIZATION.to_string(), "unknown".into());
+        keys.insert(
+            CTC_META_FRONTEND_NORMALIZATION.to_string(),
+            "unknown".into(),
+        );
         keys.insert(CTC_META_FRONTEND_DELTAS.to_string(), "maybe".into());
         assert_eq!(CtcConfig::from_metadata(&keys), CtcConfig::default());
+    }
+
+    #[test]
+    fn logit_shift_for_granite_defaults() {
+        let mut cfg = CtcConfig::default();
+        cfg.frontend.stack_factor = 2;
+        cfg.encoder_subsample = 4;
+        let shift = cfg.logit_shift_samples(160);
+        assert_eq!(shift, 1280);
+        assert!((shift as f64 / 16_000.0 - 0.080).abs() < 1e-9);
+        assert_eq!(cfg.logit_shift_samples_for(160, 400, 100), 1280);
+        assert!(!cfg.logit_frame_ratio_disagrees(400, 100));
+        assert!(cfg.logit_frame_ratio_disagrees(400, 50));
     }
 
     #[test]

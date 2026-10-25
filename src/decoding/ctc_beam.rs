@@ -1,11 +1,24 @@
 use crate::decoding::BeamConfig;
-use ndarray::Array2;
+use ndarray::{Array2, ArrayView1, ArrayView2};
 use std::collections::HashMap;
 
-/// CTC prefix beam search over a logit matrix `[time, vocab]`.
+/// CTC prefix beam search over an owned logit matrix `[time, vocab]`.
 ///
 /// Returns collapsed token ids (blank removed, repeats merged per CTC rules).
 pub fn decode_ctc_beam(logits: &Array2<f32>, blank_id: usize, config: &BeamConfig) -> Vec<u32> {
+    decode_ctc_beam_view(logits.view(), blank_id, config)
+}
+
+/// CTC prefix beam search over a borrowed logit matrix `[time, vocab]`.
+///
+/// Same hypothesis as [`decode_ctc_beam`]. Callers that already hold a
+/// contiguous logit buffer (for example an ONNX output view) use this to
+/// avoid copying the full `T x V` matrix.
+pub fn decode_ctc_beam_view(
+    logits: ArrayView2<f32>,
+    blank_id: usize,
+    config: &BeamConfig,
+) -> Vec<u32> {
     let time_steps = logits.shape()[0];
     if time_steps == 0 {
         return Vec::new();
@@ -13,7 +26,7 @@ pub fn decode_ctc_beam(logits: &Array2<f32>, blank_id: usize, config: &BeamConfi
 
     let vocab_size = logits.shape()[1];
     let beam_size = config.beam_size.max(1);
-    let top_k = beam_size.min(vocab_size);
+    let top_k = frame_candidate_k(config, vocab_size);
 
     let mut beam: HashMap<Vec<u32>, CtcBeamEntry> = HashMap::new();
     beam.insert(
@@ -25,7 +38,7 @@ pub fn decode_ctc_beam(logits: &Array2<f32>, blank_id: usize, config: &BeamConfi
     );
 
     for t in 0..time_steps {
-        let log_probs = log_softmax_row(logits.row(t));
+        let log_probs = log_softmax_row(&logits.row(t));
         let mut label_indices = top_k_indices(&log_probs, top_k);
         if !label_indices.contains(&blank_id) {
             label_indices.push(blank_id);
@@ -57,8 +70,7 @@ pub fn decode_ctc_beam(logits: &Array2<f32>, blank_id: usize, config: &BeamConfi
                     let mut extended = prefix.clone();
                     extended.push(token);
                     merge_entry(&mut next, extended, |e| {
-                        e.log_pnb =
-                            log_sum_exp(e.log_pnb, log_sum_exp(log_pb, log_pnb) + log_p);
+                        e.log_pnb = log_sum_exp(e.log_pnb, log_sum_exp(log_pb, log_pnb) + log_p);
                     });
                 }
             }
@@ -67,8 +79,7 @@ pub fn decode_ctc_beam(logits: &Array2<f32>, blank_id: usize, config: &BeamConfi
         beam = prune_beam(next, beam_size);
     }
 
-    beam
-        .iter()
+    beam.iter()
         .map(|(prefix, entry)| {
             (
                 prefix.clone(),
@@ -109,7 +120,10 @@ where
     }
 }
 
-fn prune_beam(mut beam: HashMap<Vec<u32>, CtcBeamEntry>, beam_size: usize) -> HashMap<Vec<u32>, CtcBeamEntry> {
+fn prune_beam(
+    mut beam: HashMap<Vec<u32>, CtcBeamEntry>,
+    beam_size: usize,
+) -> HashMap<Vec<u32>, CtcBeamEntry> {
     let mut ranked: Vec<(Vec<u32>, CtcBeamEntry)> = beam.drain().collect();
     ranked.sort_by(|(_, a), (_, b)| {
         prefix_score(b)
@@ -120,10 +134,28 @@ fn prune_beam(mut beam: HashMap<Vec<u32>, CtcBeamEntry>, beam_size: usize) -> Ha
     ranked.into_iter().collect()
 }
 
-fn log_softmax_row(row: ndarray::ArrayView1<f32>) -> Vec<f32> {
-    let max_logit = row
-        .iter()
-        .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+/// Labels considered at one frame. `frame_topk == 0` keeps `beam_size`.
+fn frame_candidate_k(config: &BeamConfig, vocab_size: usize) -> usize {
+    let beam = config.beam_size.max(1);
+    let k = if config.frame_topk == 0 {
+        beam
+    } else {
+        config.frame_topk.max(1)
+    };
+    k.min(vocab_size)
+}
+
+fn log_softmax_row(row: &ArrayView1<f32>) -> Vec<f32> {
+    if let Some(slice) = row.as_slice() {
+        log_softmax_slice(slice)
+    } else {
+        let owned: Vec<f32> = row.iter().copied().collect();
+        log_softmax_slice(&owned)
+    }
+}
+
+fn log_softmax_slice(row: &[f32]) -> Vec<f32> {
+    let max_logit = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let exps: Vec<f32> = row.iter().map(|&x| (x - max_logit).exp()).collect();
     let sum: f32 = exps.iter().sum();
     let log_sum = sum.ln() + max_logit;
@@ -132,15 +164,9 @@ fn log_softmax_row(row: ndarray::ArrayView1<f32>) -> Vec<f32> {
 
 fn top_k_indices(log_probs: &[f32], k: usize) -> Vec<usize> {
     let k = k.min(log_probs.len());
-    let mut indexed: Vec<(usize, f32)> = log_probs
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| (i, v))
-        .collect();
-    indexed.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let mut indexed: Vec<(usize, f32)> =
+        log_probs.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     indexed.into_iter().take(k).map(|(i, _)| i).collect()
 }
 
@@ -232,6 +258,7 @@ mod tests {
             patience: 1.0,
             max_symbols_per_step: 10,
             duration_reward: 0.67,
+            frame_topk: 0,
         };
         let tokens = decode_ctc_beam(&logits, 0, &config);
         assert_eq!(tokens, vec![1, 2]);
@@ -254,10 +281,65 @@ mod tests {
             patience: 1.0,
             max_symbols_per_step: 10,
             duration_reward: 0.67,
+            frame_topk: 0,
         };
         assert_eq!(
             decode_ctc_beam(&logits, 0, &config),
             decode_ctc_greedy(&logits, 0)
         );
+    }
+
+    fn ctc_config(beam_size: usize, frame_topk: usize) -> BeamConfig {
+        BeamConfig {
+            beam_size,
+            length_penalty: 0.0,
+            patience: 1.0,
+            max_symbols_per_step: 10,
+            duration_reward: 0.67,
+            frame_topk,
+        }
+    }
+
+    #[test]
+    fn ctc_beam_view_matches_owned() {
+        let logits = logits_from_frame_probs(
+            &[
+                &[(0, 0.1), (1, 0.8), (3, 0.05)],
+                &[(0, 0.1), (1, 0.7), (4, 0.1)],
+                &[(0, 0.15), (2, 0.75), (5, 0.05)],
+                &[(0, 0.9), (2, 0.05)],
+            ],
+            8,
+        );
+        let config = ctc_config(4, 0);
+        assert_eq!(
+            decode_ctc_beam(&logits, 0, &config),
+            decode_ctc_beam_view(logits.view(), 0, &config)
+        );
+    }
+
+    #[test]
+    fn ctc_beam_topk_prunes_labels_outside_k() {
+        // Blank is the top label. Token 1 is second and is the best emission.
+        // `frame_topk = 1` keeps only blank (blank is also forced in), so the
+        // hypothesis stays empty. `frame_topk = 2` covers token 1 and matches
+        // the uncapped (`frame_topk = 0` -> beam_size) search.
+        let logits = logits_from_frame_probs(
+            &[
+                &[(0, 0.45), (1, 0.40), (2, 0.15)],
+                &[(0, 0.45), (1, 0.40), (2, 0.15)],
+            ],
+            3,
+        );
+        let full = ctc_config(5, 0);
+        let covered = ctc_config(5, 2);
+        let pruned = ctc_config(5, 1);
+        let full_tokens = decode_ctc_beam(&logits, 0, &full);
+        assert_eq!(full_tokens, vec![1]);
+        assert_eq!(
+            decode_ctc_beam_view(logits.view(), 0, &covered),
+            full_tokens
+        );
+        assert_eq!(decode_ctc_beam(&logits, 0, &pruned), Vec::<u32>::new());
     }
 }

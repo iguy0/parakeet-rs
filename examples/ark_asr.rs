@@ -30,10 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let model_dir = &args[1];
     let audio_path = &args[2];
-    let max_new_tokens = args
-        .get(3)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(256usize);
+    let max_new_tokens = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(256usize);
 
     println!("Loading ARK-ASR model...");
     let load_start = Instant::now();
@@ -47,8 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let reader = hound::WavReader::open(audio_path)?;
     let spec = reader.spec();
-    let duration_secs =
-        reader.duration() as f32 / spec.sample_rate.max(1) as f32;
+    let duration_secs = reader.duration() as f32 / spec.sample_rate.max(1) as f32;
 
     println!("\n{}", result.text);
     println!(

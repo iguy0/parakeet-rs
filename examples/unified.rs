@@ -109,7 +109,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let duration = audio.len() as f32 / 16000.0;
-    println!("Audio: {:.1}s, {}Hz, {} ch", duration, spec.sample_rate, spec.channels);
+    println!(
+        "Audio: {:.1}s, {}Hz, {} ch",
+        duration, spec.sample_rate, spec.channels
+    );
 
     let mut model = ParakeetUnified::from_pretrained_with_decoding(
         "./unified",
@@ -150,7 +153,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("\nSentences:");
         for segment in &result.tokens {
-            println!("[{:.2}s - {:.2}s]: {}", segment.start, segment.end, segment.text);
+            println!(
+                "[{:.2}s - {:.2}s]: {}",
+                segment.start, segment.end, segment.text
+            );
         }
 
         let elapsed = transcribe_start.elapsed();

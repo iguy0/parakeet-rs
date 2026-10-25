@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::{fmt, sync::Arc};
 
 use crate::error::Result;
-use ort::session::builder::SessionBuilder;
 use ort::session::Session;
+use ort::session::builder::SessionBuilder;
 
 // Hardware acceleration options. CPU is default and most reliable.
 // GPU providers (CUDA, TensorRT, MIGraphX) offer 5-10x speedup but require specific hardware.

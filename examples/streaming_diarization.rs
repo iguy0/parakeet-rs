@@ -33,7 +33,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "sortformer"))]
     {
         eprintln!("Error: This example requires the 'sortformer' feature.");
-        eprintln!("Run with: cargo run --example streaming_diarization --features sortformer <audio.wav>");
+        eprintln!(
+            "Run with: cargo run --example streaming_diarization --features sortformer <audio.wav>"
+        );
         return Err("sortformer feature not enabled".into());
     }
 
@@ -41,9 +43,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let start_time = Instant::now();
         let args: Vec<String> = env::args().collect();
-        let audio_path = args.get(1).expect(
-            "Usage: streaming-diarization <audio.wav> [model.onnx]",
-        );
+        let audio_path = args
+            .get(1)
+            .expect("Usage: streaming-diarization <audio.wav> [model.onnx]");
         let model_path = args
             .get(2)
             .map(String::as_str)
@@ -139,7 +141,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             total_segments = segments.len();
         } else {
-            println!("\nStreaming diarization (feeding {}ms chunks):", feed_chunk_size * 1000 / 16_000);
+            println!(
+                "\nStreaming diarization (feeding {}ms chunks):",
+                feed_chunk_size * 1000 / 16_000
+            );
             println!("{}", "-".repeat(60));
 
             for chunk in audio.chunks(feed_chunk_size) {

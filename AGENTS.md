@@ -60,25 +60,28 @@ git push-fork        # push current branch to origin (iguy0)
 
 | Path | Status | Notes |
 |------|--------|-------|
-| `src/decoding/` | Added | Beam search module (`ctc_beam`, `tdt_beam`, `rnnt_beam`) + `DecodingStrategy`/`BeamConfig`; ported from parakeet-mlx defaults |
-| `src/parakeet.rs`, `src/parakeet_tdt.rs`, `src/parakeet_unified.rs`, `src/nemotron.rs`, `src/model_tdt.rs` | Modified | `from_pretrained_with_decoding` / `set_decoding_strategy` wiring for greedy-vs-beam |
-| `tests/model_benchmark.rs`, `tests/common/mod.rs` | Added | Model-backed WER/DER smoke + benchmark tests (skip gracefully when weights absent) |
+| `src/decoding/` | Added | Beam search module (`ctc_beam`, `tdt_beam`, `rnnt_beam`) + `DecodingStrategy`/`BeamConfig`; ported from parakeet-mlx defaults. CTC beam also accepts an `ArrayView2` (`decode_ctc_beam_view`). `BeamConfig::frame_topk` (`0` = `beam_size`) is CTC-only; default hypotheses stay the same |
+| `src/parakeet.rs`, `src/parakeet_tdt.rs`, `src/parakeet_unified.rs`, `src/nemotron.rs`, `src/model_tdt.rs` | Modified | `from_pretrained_with_decoding` / `set_decoding_strategy` wiring for greedy-vs-beam. Parakeet CTC beam decodes through `ParakeetModel::with_logits` (no owned `T x V` copy) |
+| `tests/model_benchmark.rs`, `tests/common/mod.rs` | Added | Model-backed WER/DER smoke + benchmark tests (skip gracefully when weights absent). Granite: `granite_long_audio_completes` (`PARAKEET_BENCH_ALL=1`, ceiling `GRANITE_LONG_MAX_WER` default 0.35), ignored `granite_beam_peak_rss`, `granite_ctc_beam_matches_before` (`PARAKEET_GRANITE_BEAM_BASELINE`) |
 | `scripts/benchmark/` | Added | `run_all.sh`, `manifest.toml`, `compare_greedy_beam.py` greedy-vs-beam harness |
 | `plans/BEAM_SEARCH_IMPLEMENTATION_PLAN.md` | Added | Design notes for the beam search work |
 | `scripts/export_nemotron_streaming.py` | Modified | Export/latency documentation and `--right-context` presets |
-| `src/nemotron.rs` | Modified | 560 ms chunk config comment + beam decoding hook |
+| `src/nemotron.rs` | Modified | 560 ms chunk config comment + beam decoding hook; `flush` / `flush_with_tokens` finish the streaming tail (offline last-chunk pad); `#[doc(hidden)] stage_timing_ns` |
 | `scripts/quantize_nemotron_streaming.py` | Untracked | Local INT8/INT4 quantization tooling (candidate for upstream) |
 | `scripts/export_ultra_diar_8spk.py` | Untracked | 8-speaker Sortformer export |
 | `scripts/export_nemotron3_diarization.py` | Added | `nvidia/Nemotron-3-Diarization` export (31-layer RoPE transformer, 8 spk, 99.2M params). Same 6-in/3-out ONNX contract as the other Sortformer exports; presets `offline`/`low`/`verylow`/`ultralow`; swaps NeMo FlexAttention for dense-mask SDPA at export time; stamps cache-compression metadata; optional `--int8-output` + `--compare-wav` |
 | `src/sortformer.rs` (metadata) | Modified | `num_speakers` (default 4), plus optional `spkcache_sil_frames_per_spk` (default 3), `scores_boost_latest` (default 0), `sil_emb` (fixed silence embedding replacing the running mean). Absent keys keep legacy behaviour |
-| `src/sortformer.rs` (API) | Modified | `SessionRouter` + `set_session_router`; `diarize()` = `predict_raw()` + `post_process()`; `feed_raw`/`flush_raw` (raw 80 ms probabilities); `feed`/`flush` post-process continuously across windows via private `StreamPost` (`set_continuous_feed(false)` = legacy per-window); `DiarizationConfig::nemotron3()` preset |
+| `src/sortformer.rs` (API) | Modified | `SessionRouter` + `set_session_router`; `diarize()` = `predict_raw()` + `post_process()`; `feed_raw`/`flush_raw` (raw 80 ms probabilities); `feed`/`flush` post-process continuously across windows via private `StreamPost` (`set_continuous_feed(false)` = legacy per-window); `DiarizationConfig::nemotron3()` preset. `session_runs` (`doc(hidden)`) counts streaming ONNX runs since `reset_state` |
+| `src/multitalker.rs` | Modified | Opt-in `MultitalkerConfig::diar_strategy`: `DiarStrategy::PerChunk` (default, one `diarize_chunk_raw` per ASR chunk) or `Buffered` (`feed_raw` / `flush_raw`, ASR chunks wait until 80 ms frames cover them; `flush` finishes the tail). Vocab size and blank id come from the tokenizer and the joint-network output, falling back to 1024/1024 |
 | `tests/common/mod.rs`, `tests/model_benchmark.rs` (diarization) | Modified | Env knobs `PARAKEET_DIAR_PRESET`, `PARAKEET_BENCH_SAMPLES`, `PARAKEET_STREAM_ROUTES`; tests `sortformer_streaming_der_report` and `diarization_threshold_sweep` (`--ignored`). See section 4 Testing |
-| `src/config.rs` | Modified | `CtcConfig`/`CtcFrontendConfig`/`NormalizationMode` — metadata-driven CTC blank-id/token-offset/frontend (deltas, frame stacking, db-floor normalization, encoder subsample), read from ONNX `metadata_props` with Parakeet-CTC-0.6b defaults when absent |
+| `src/config.rs` | Modified | `CtcConfig`/`CtcFrontendConfig`/`NormalizationMode` — metadata-driven CTC blank-id/token-offset/frontend (deltas, frame stacking, db-floor normalization, encoder subsample), read from ONNX `metadata_props` with Parakeet-CTC-0.6b defaults when absent. `logit_frame_ratio_disagrees` checks `encoder_subsample * stack_factor` against the first forward |
 | `scripts/patch_ctc_onnx_metadata.py` | Added | Stamps `ctc_*` metadata keys onto third-party CTC ONNX graphs (e.g. Granite TurboCTC) so `CtcConfig::from_metadata` picks them up |
-| `src/model.rs` | Modified | Reads `CtcConfig` from session metadata at load time via `ctc_config_from_session` |
+| `src/model.rs` | Modified | Reads `CtcConfig` from session metadata at load time via `ctc_config_from_session`. `with_logits` borrows the logit buffer; `forward` still returns an owned array. One stderr warning if the first forward's frame ratio disagrees with metadata |
 | `src/execution.rs` | Modified | `ModelConfig::build_session()` public; `ModelConfig` is `Send + Sync` (`configure` hook now `Arc<dyn Fn(...) + Send + Sync>`); `coreml_cache_dir` (skip CoreML recompilation); `webgpu_device_id` *(feature `webgpu`)*; forces sequential execution + disabled memory pattern for WebGPU/DirectML |
 | `src/model_tdt.rs` | Modified | `ParakeetTDTModel::from_pretrained_with_configs` — separate `ExecutionConfig` for the encoder vs. the decoder/joint session |
-| `src/ark_asr.rs`, `src/model_ark.rs` | Added | `ArkAsr` speech-LLM transcriber *(feature `ark-asr`)* — Whisper-style audio encoder + adapter + Qwen2 causal LM with static KV cache, for `Audio8/ark-asr-0.6b-int8-onnx` |
+| `src/ark_asr.rs`, `src/model_ark.rs` | Added | `ArkAsr` speech-LLM transcriber *(feature `ark-asr`)* — Whisper-style audio encoder + adapter + Qwen2 causal LM with static KV cache, for `Audio8/ark-asr-0.6b-int8-onnx`. `ArkLongAudioPolicy` (default `Truncate`) + `transcribe_long`; audio-token count taken from the encoder output; optional `set_repeat_guard` (default off) |
+| `src/cohere.rs`, `src/model_cohere.rs`, `src/audio.rs` | Modified | `transcribe_audio_long` + `set_max_chunk_secs` (default 35 s, quiet-point split shared with Ark via `audio::split_at_quiet_point`). Decoder reuses encoder K/V after the first step; layer/head/head-dim come from the decoder graph. Optional steady decoder: `set_use_steady_decoder` (default on when `decoder_model_steady.onnx` or `decoder_model_steady_quantized.onnx` sits next to the merged decoder, flat or under `onnx/`); absent file keeps the merged graph for every step |
+| `scripts/export_cohere_steady_decoder.py` | Added | Derives a steady-state Cohere decoder from the Optimum merged graph (no first-step `If`, no `encoder_hidden_states`, no `present.*.encoder.*`). Stamps `cohere_decoder_variant=steady`. External weights stay at their original offsets; the data file is hardlinked beside the output, or copied if the filesystem rejects the link |
 | `tests/auto_traits.rs` | Added | Compile-time `Send`/`Sync` assertion for `Sortformer` (gated on feature `sortformer`) |
 | `plans/WEBGPU_IMPLEMENTATION_PLAN.md` | Added | WebGPU EP validation plan/progress (Linux Vulkan dev, Windows D3D12 path, Nemotron-only correctness policy) |
 | `AGENTS.md` | Untracked | This file |
@@ -171,8 +174,8 @@ Post-processing: `DiarizationConfig` presets (`callhome()`, `dihard3()`, `ultra_
 
 | Model | Category | Notes |
 |-------|----------|-------|
-| CTC, TDT | Batch/offline only | `Transcriber` trait, one call per clip, ~4-5 min limit |
-| Cohere Transcribe | Batch/offline only | `transcribe_audio` one-shot; caller chunks long-form audio manually, no persisted cache |
+| CTC, TDT | Batch/offline only | `Transcriber` trait, one call per clip. The ~4-5 min limit applies to Parakeet FastConformer CTC/TDT. Granite TurboCTC completed one-shot greedy calls at 632.28 s and 1750.30 s (2026-10-24) |
+| Cohere Transcribe | Batch/offline only | `transcribe_audio` is one shot and is not guaranteed past ~35 s. `transcribe_audio_long` splits at a quiet point in the last 5 s of each window (default 35 s) and joins text. No persisted cache |
 | Ark ASR | Batch/offline only | Fixed-length static KV cache sized by model manifest; no chunk/streaming API |
 | EOU, Nemotron, Multitalker | Streaming only | `*Handle` + chunk method; see Streaming ASR table above |
 | Sortformer (4spk, 8spk, Nemotron-3) | Both | `diarize()` = offline full-file; `feed()`/`flush()` = buffered streaming with persisted FIFO/cache and continuous cross-window post-processing; `diarize_chunk()` = stateful but per-call relative timestamps |
@@ -207,8 +210,9 @@ Post-processing: `DiarizationConfig` presets (`callhome()`, `dihard3()`, `ultra_
 | `scripts/benchmark/run_all.sh` | Greedy-vs-beam example harness (env-driven model/clip selection) | Drives `examples/*` with `--decoding greedy|beam` |
 | `scripts/benchmark/compare_greedy_beam.py` | Transcript edit-distance / optional WER diff for greedy vs beam | Consumed by `run_all.sh` |
 | `scripts/patch_ctc_onnx_metadata.py` | Stamps `ctc_*` `metadata_props` (blank id, token offset, frontend deltas/stacking/normalization, encoder subsample) onto third-party single-file CTC ONNX graphs | `config.rs` `CtcConfig::from_metadata`, `model.rs` `ctc_config_from_session` |
+| `scripts/export_cohere_steady_decoder.py` | Steady-state decoder from the Optimum merged graph (direct past encoder K/V, no `present.*.encoder.*`). Stamps `cohere_decoder_variant=steady` | `model_cohere.rs` uses it for every step after the first when the file is present |
 
-Cohere uses upstream Optimum export — no custom script in-repo (`cohere.rs` documents CLI). Ark ASR consumes a pre-built INT8 ONNX package from HuggingFace (`Audio8/ark-asr-0.6b-int8-onnx`) — no export script in-repo.
+Cohere's merged decoder still comes from Optimum (`cohere.rs` documents that CLI). `scripts/export_cohere_steady_decoder.py` derives an optional steady-state graph from that file; without it, decode behavior is unchanged. Ark ASR consumes a pre-built INT8 ONNX package from HuggingFace (`Audio8/ark-asr-0.6b-int8-onnx`) — no export script in-repo.
 
 ---
 
@@ -262,8 +266,9 @@ flowchart LR
 
 ### Hard Constraints
 
+- **Python environment:** All Python work (export, quantize, patch, benchmark scripts under `scripts/`) must run inside the `onnx` conda environment (`conda activate onnx`). Do not use the base env or create ad-hoc venvs. When a task needs a missing or outdated library (e.g. `torch`, `onnx`, `onnxruntime`, `optimum`, `nemo-toolkit`), install or upgrade it into `onnx` with `pip install` / `conda install` rather than elsewhere, and keep pins noted here (e.g. the NeMo `main` + `lhotse` constraint below). Scripts must not hardcode this env name; the requirement is a workflow rule for this workspace.
 - **Audio:** 16 kHz mono; 16-bit PCM or 32-bit float WAV.
-- **CTC/TDT length limit:** ~4–5 minutes per call; use streaming models or chunking for longer audio.
+- **CTC/TDT length limit:** The ~4-5 minute per-call limit applies to Parakeet FastConformer CTC/TDT; use streaming models or chunking for longer audio on those graphs. Granite TurboCTC (block attention) completed without chunking on committee (632.28 s, greedy WER 0.0959, RTFx 17.76; beam WER 0.0959, RTFx 16.03) and on datascience-staff-meeting (1750.30 s, greedy WER 0.1131, RTFx 17.30). Datascience beam was not measured.
 - **Nemotron latency is export-time locked:** Changing `--right-context` in export requires updating `CHUNK_SIZE` in `src/nemotron.rs` (see table in `export_nemotron_streaming.py` header).
 - **Mel/STFT must match training:** Custom STFT in Rust (librosa-inspired for Sortformer); do not swap for naive DFT.
 - **CTC config is metadata-driven, not `config.json`-driven:** `CtcConfig` (blank id, token offset, frontend deltas/stacking/normalization, encoder subsample) is read from ONNX `metadata_props` at session-load time (`model.rs` `ctc_config_from_session`), falling back to Parakeet-CTC-0.6b defaults when absent. Third-party graphs (e.g. Granite TurboCTC) need `scripts/patch_ctc_onnx_metadata.py` run once to stamp the keys; `ModelConfigJson`/`PreprocessorConfig` in `config.rs` still assume Parakeet-CTC-0.6b shapes and are not read from `config.json` at runtime.

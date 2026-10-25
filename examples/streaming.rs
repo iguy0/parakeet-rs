@@ -241,27 +241,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print!("Streaming: ");
 
     for chunk in audio.chunks(chunk_size) {
-        let chunk_vec = if chunk.len() < chunk_size {
-            let mut p = chunk.to_vec();
-            p.resize(chunk_size, 0.0);
-            p
-        } else {
-            chunk.to_vec()
-        };
-
-        let text = model.transcribe_chunk(&chunk_vec)?;
+        let text = model.transcribe_chunk(chunk)?;
         if !text.is_empty() {
             print!("{}", text);
             std::io::stdout().flush()?;
         }
     }
 
-    // Flush
-    for _ in 0..3 {
-        let text = model.transcribe_chunk(&vec![0.0; chunk_size])?;
-        if !text.is_empty() {
-            print!("{}", text);
-        }
+    // Decode the tail shorter than one chunk. Call `reset()` before a new utterance.
+    let text = model.flush()?;
+    if !text.is_empty() {
+        print!("{}", text);
+        std::io::stdout().flush()?;
     }
 
     println!("\n\nFinal: {}", model.get_transcript());

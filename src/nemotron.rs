@@ -1,14 +1,15 @@
 use crate::decoder::{TimedToken, TranscriptionResult};
-use crate::decoding::{decode_rnnt_beam, DecodingStrategy, RnntHypothesis};
+use crate::decoding::{DecodingStrategy, RnntHypothesis, decode_rnnt_beam};
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_nemotron::{NemotronEncoderCache, NemotronModel};
-use crate::timestamps::{process_timestamps, rebuild_text, TimestampMode};
-use ndarray::{s, Array2, Array3};
+use crate::timestamps::{TimestampMode, process_timestamps, rebuild_text};
+use ndarray::{Array2, Array3, s};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 // Nemotron 0.6B model constants
 // note that those numbers are coming from offical impl. and of course my onnx export decisions.
@@ -56,8 +57,23 @@ pub struct TokenInfo {
 /// computes while taking the argmax — passing it in lets us walk the logits
 /// just once more (the exp-sum) instead of a second max pass.
 fn log_softmax_at(logits: &[f32], idx: usize, max_logit: f32) -> f32 {
-    let lse = max_logit + logits.iter().map(|x| (x - max_logit).exp()).sum::<f32>().ln();
+    let lse = max_logit
+        + logits
+            .iter()
+            .map(|x| (x - max_logit).exp())
+            .sum::<f32>()
+            .ln();
     logits[idx] - lse
+}
+
+/// `processed_signal_length` for a flush tail, matching the offline last chunk:
+/// `pre_encode_cache + remaining_frames`. `None` when there is nothing to run.
+fn flush_tail_length(pre_encode_cache: usize, remaining_frames: usize) -> Option<i64> {
+    if remaining_frames == 0 {
+        None
+    } else {
+        Some((pre_encode_cache.saturating_add(remaining_frames)) as i64)
+    }
 }
 
 /// Language → prompt embedding index for the multilingual model. Mirrors
@@ -80,30 +96,126 @@ fn log_softmax_at(logits: &[f32], idx: usize, max_logit: f32) -> f32 {
 ///
 /// See: https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b
 const PROMPT_DICTIONARY: &[(&str, i64)] = &[
-    ("af-ZA", 54), ("am-ET", 49), ("ar", 7), ("ar-AR", 7), ("auto", 101),
-    ("ay-BO", 81), ("az-AZ", 66), ("bg", 30), ("bg-BG", 30), ("bn-IN", 36),
-    ("cs", 22), ("cs-CZ", 22), ("da", 25), ("da-DK", 25), ("de", 9),
-    ("de-DE", 9), ("el", 21), ("el-GR", 21), ("en", 0), ("en-GB", 1),
-    ("en-US", 0), ("enGB", 1), ("es", 3), ("es-ES", 2), ("es-US", 3),
-    ("esES", 2), ("et", 60), ("et-EE", 60), ("fa-IR", 38), ("fi", 26),
-    ("fi-FI", 26), ("fr", 8), ("fr-CA", 100), ("fr-FR", 8), ("gn-PY", 82),
-    ("gu-IN", 42), ("ha-NG", 50), ("haw-US", 97), ("he-IL", 64), ("hi", 6),
-    ("hi-HI", 6), ("hi-IN", 6), ("hr", 29), ("hr-HR", 29), ("hu", 23),
-    ("hu-HU", 23), ("hy-AM", 68), ("id-ID", 34), ("ig-NG", 53), ("it", 15),
-    ("it-IT", 15), ("ja-JA", 10), ("ja-JP", 10), ("ka-GE", 67), ("km-KH", 47),
-    ("kn-IN", 43), ("ko", 14), ("ko-KO", 14), ("ko-KR", 14), ("ku-TR", 65),
-    ("ky-KG", 71), ("ln-CD", 58), ("lt", 31), ("lt-LT", 31), ("lv", 61),
-    ("lv-LV", 61), ("mi-NZ", 96), ("ml-IN", 44), ("mr-IN", 41), ("ms-MY", 35),
-    ("mt-MT", 102), ("nah-MX", 83), ("nb", 103), ("nb-NO", 103), ("ne-NP", 46),
-    ("nl", 16), ("nl-NL", 16), ("nn", 104), ("nn-NO", 104), ("no", 27),
-    ("no-NO", 27), ("ny-MW", 57), ("or-KE", 59), ("pl", 17), ("pl-PL", 17),
-    ("pt", 13), ("pt-BR", 12), ("pt-PT", 13), ("qu-PE", 80), ("ro", 20),
-    ("ro-RO", 20), ("ru", 11), ("ru-RU", 11), ("rw-RW", 55), ("si-LK", 45),
-    ("sk", 28), ("sk-SK", 28), ("sl", 62), ("sl-SI", 62), ("sm-WS", 98),
-    ("so-SO", 56), ("sv", 24), ("sv-SE", 24), ("sw-KE", 48), ("ta-IN", 39),
-    ("te-IN", 40), ("tg-TJ", 70), ("th-TH", 32), ("to-TO", 99), ("tr", 18),
-    ("tr-TR", 18), ("uk", 19), ("uk-UA", 19), ("ur-PK", 37), ("uz-UZ", 69),
-    ("vi-VN", 33), ("yo-NG", 52), ("zh-CN", 4), ("zh-TW", 5), ("zh-ZH", 4),
+    ("af-ZA", 54),
+    ("am-ET", 49),
+    ("ar", 7),
+    ("ar-AR", 7),
+    ("auto", 101),
+    ("ay-BO", 81),
+    ("az-AZ", 66),
+    ("bg", 30),
+    ("bg-BG", 30),
+    ("bn-IN", 36),
+    ("cs", 22),
+    ("cs-CZ", 22),
+    ("da", 25),
+    ("da-DK", 25),
+    ("de", 9),
+    ("de-DE", 9),
+    ("el", 21),
+    ("el-GR", 21),
+    ("en", 0),
+    ("en-GB", 1),
+    ("en-US", 0),
+    ("enGB", 1),
+    ("es", 3),
+    ("es-ES", 2),
+    ("es-US", 3),
+    ("esES", 2),
+    ("et", 60),
+    ("et-EE", 60),
+    ("fa-IR", 38),
+    ("fi", 26),
+    ("fi-FI", 26),
+    ("fr", 8),
+    ("fr-CA", 100),
+    ("fr-FR", 8),
+    ("gn-PY", 82),
+    ("gu-IN", 42),
+    ("ha-NG", 50),
+    ("haw-US", 97),
+    ("he-IL", 64),
+    ("hi", 6),
+    ("hi-HI", 6),
+    ("hi-IN", 6),
+    ("hr", 29),
+    ("hr-HR", 29),
+    ("hu", 23),
+    ("hu-HU", 23),
+    ("hy-AM", 68),
+    ("id-ID", 34),
+    ("ig-NG", 53),
+    ("it", 15),
+    ("it-IT", 15),
+    ("ja-JA", 10),
+    ("ja-JP", 10),
+    ("ka-GE", 67),
+    ("km-KH", 47),
+    ("kn-IN", 43),
+    ("ko", 14),
+    ("ko-KO", 14),
+    ("ko-KR", 14),
+    ("ku-TR", 65),
+    ("ky-KG", 71),
+    ("ln-CD", 58),
+    ("lt", 31),
+    ("lt-LT", 31),
+    ("lv", 61),
+    ("lv-LV", 61),
+    ("mi-NZ", 96),
+    ("ml-IN", 44),
+    ("mr-IN", 41),
+    ("ms-MY", 35),
+    ("mt-MT", 102),
+    ("nah-MX", 83),
+    ("nb", 103),
+    ("nb-NO", 103),
+    ("ne-NP", 46),
+    ("nl", 16),
+    ("nl-NL", 16),
+    ("nn", 104),
+    ("nn-NO", 104),
+    ("no", 27),
+    ("no-NO", 27),
+    ("ny-MW", 57),
+    ("or-KE", 59),
+    ("pl", 17),
+    ("pl-PL", 17),
+    ("pt", 13),
+    ("pt-BR", 12),
+    ("pt-PT", 13),
+    ("qu-PE", 80),
+    ("ro", 20),
+    ("ro-RO", 20),
+    ("ru", 11),
+    ("ru-RU", 11),
+    ("rw-RW", 55),
+    ("si-LK", 45),
+    ("sk", 28),
+    ("sk-SK", 28),
+    ("sl", 62),
+    ("sl-SI", 62),
+    ("sm-WS", 98),
+    ("so-SO", 56),
+    ("sv", 24),
+    ("sv-SE", 24),
+    ("sw-KE", 48),
+    ("ta-IN", 39),
+    ("te-IN", 40),
+    ("tg-TJ", 70),
+    ("th-TH", 32),
+    ("to-TO", 99),
+    ("tr", 18),
+    ("tr-TR", 18),
+    ("uk", 19),
+    ("uk-UA", 19),
+    ("ur-PK", 37),
+    ("uz-UZ", 69),
+    ("vi-VN", 33),
+    ("yo-NG", 52),
+    ("zh-CN", 4),
+    ("zh-TW", 5),
+    ("zh-ZH", 4),
     ("zu-ZA", 51),
 ];
 
@@ -118,11 +230,13 @@ fn is_lang_tag(piece: &str) -> bool {
     let inner = &bytes[1..bytes.len() - 1];
     match inner.len() {
         2 => inner[0].is_ascii_lowercase() && inner[1].is_ascii_lowercase(),
-        5 => inner[0].is_ascii_lowercase()
-            && inner[1].is_ascii_lowercase()
-            && inner[2] == b'-'
-            && inner[3].is_ascii_uppercase()
-            && inner[4].is_ascii_uppercase(),
+        5 => {
+            inner[0].is_ascii_lowercase()
+                && inner[1].is_ascii_lowercase()
+                && inner[2] == b'-'
+                && inner[3].is_ascii_uppercase()
+                && inner[4].is_ascii_uppercase()
+        }
         _ => false,
     }
 }
@@ -372,6 +486,13 @@ pub struct Nemotron {
     audio_processed: usize,
     chunk_idx: usize,
     accumulated_tokens: Vec<usize>,
+    /// Set by [`Self::flush`]. `transcribe_chunk` returns empty until [`Self::reset`].
+    stream_finished: bool,
+    /// When true, [`Self::stage_timing_ns`] accumulates mel / encoder / decoder time.
+    record_stage_timing: bool,
+    mel_ns: u128,
+    encoder_ns: u128,
+    decoder_ns: u128,
 }
 
 impl NemotronHandle {
@@ -437,10 +558,7 @@ impl NemotronHandle {
     }
 
     /// Backwards-compatible alias for [`NemotronHandle::from_pretrained`].
-    pub fn load<P: AsRef<Path>>(
-        path: P,
-        exec_config: Option<ExecutionConfig>,
-    ) -> Result<Self> {
+    pub fn load<P: AsRef<Path>>(path: P, exec_config: Option<ExecutionConfig>) -> Result<Self> {
         Self::from_pretrained(path, exec_config)
     }
 
@@ -549,6 +667,11 @@ impl Nemotron {
             audio_processed: 0,
             chunk_idx: 0,
             accumulated_tokens: Vec::new(),
+            stream_finished: false,
+            record_stage_timing: false,
+            mel_ns: 0,
+            encoder_ns: 0,
+            decoder_ns: 0,
         }
     }
 
@@ -613,6 +736,53 @@ impl Nemotron {
         self.audio_processed = 0;
         self.chunk_idx = 0;
         self.accumulated_tokens.clear();
+        self.stream_finished = false;
+    }
+
+    /// Accumulate mel / encoder / decoder nanoseconds on the streaming path.
+    ///
+    /// Default off. The check is a single bool; timers are not read when this
+    /// is false. Passing `true` zeroes the counters. [`Self::reset`] does not
+    /// clear them, so a multi-utterance measurement can keep accumulating.
+    /// Read the totals with [`Self::stage_timing_ns`].
+    pub fn set_record_stage_timing(&mut self, enabled: bool) {
+        self.record_stage_timing = enabled;
+        if enabled {
+            self.mel_ns = 0;
+            self.encoder_ns = 0;
+            self.decoder_ns = 0;
+        }
+    }
+
+    /// Accumulated streaming-stage time in nanoseconds: `(mel, encoder, decoder)`.
+    ///
+    /// Stays zero unless [`Self::set_record_stage_timing`] was enabled. Covers
+    /// [`Self::transcribe_chunk`] and [`Self::flush`], not the offline path.
+    #[doc(hidden)]
+    pub fn stage_timing_ns(&self) -> (u128, u128, u128) {
+        (self.mel_ns, self.encoder_ns, self.decoder_ns)
+    }
+
+    fn timing_start(&self) -> Option<Instant> {
+        self.record_stage_timing.then(Instant::now)
+    }
+
+    fn add_mel_ns(&mut self, start: Option<Instant>) {
+        if let Some(start) = start {
+            self.mel_ns += start.elapsed().as_nanos();
+        }
+    }
+
+    fn add_encoder_ns(&mut self, start: Option<Instant>) {
+        if let Some(start) = start {
+            self.encoder_ns += start.elapsed().as_nanos();
+        }
+    }
+
+    fn add_decoder_ns(&mut self, start: Option<Instant>) {
+        if let Some(start) = start {
+            self.decoder_ns += start.elapsed().as_nanos();
+        }
     }
 
     /// Get the full accumulated transcript. Language tag tokens (e.g. `<en-US>`)
@@ -764,9 +934,10 @@ impl Nemotron {
             let chunk_length = self.pre_encode_cache + main_len;
 
             let (encoded, enc_len, new_cache) = {
-                let mut model = self.model.lock().map_err(|e| {
-                    Error::Model(format!("Failed to acquire model lock: {e}"))
-                })?;
+                let mut model = self
+                    .model
+                    .lock()
+                    .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
                 model.run_encoder(
                     &mel_chunk,
                     chunk_length as i64,
@@ -808,90 +979,177 @@ impl Nemotron {
     /// Stream transcribe a chunk of audio (call repeatedly for real-time).
     ///
     /// This buffers raw audio and computes mel spectrograms over the full buffer
-    /// to avoid edge effects at chunk boundaries.
+    /// to avoid edge effects at chunk boundaries. Only full `chunk_samples()`
+    /// windows are decoded; the shorter tail stays buffered until [`Self::flush`].
+    ///
+    /// After `flush`, this returns an empty string and does not panic. Call
+    /// [`Self::reset`] before starting a new utterance.
     pub fn transcribe_chunk(&mut self, audio_chunk: &[f32]) -> Result<String> {
         let tokens = self.process_chunk(audio_chunk)?;
+        Ok(self.join_token_text(&tokens))
+    }
+
+    /// Finish the utterance: decode buffered audio shorter than a full chunk.
+    ///
+    /// Full chunks still sitting in the buffer are emitted first (same step as
+    /// [`Self::transcribe_chunk`]). The remaining mel frames are zero-padded to
+    /// `chunk_size`, matching the offline path's last chunk, and run with
+    /// `processed_signal_length = pre_encode_cache + remaining_frames`.
+    ///
+    /// Returns only the newly emitted text (language tags stripped). The full
+    /// utterance is [`Self::get_transcript`]. In beam mode, accumulated tokens
+    /// follow the same global-best update as `transcribe_chunk`.
+    ///
+    /// A second call returns an empty string until [`Self::reset`]. An empty
+    /// buffer, or a buffer with no unprocessed frames, also returns empty and
+    /// marks the stream finished.
+    pub fn flush(&mut self) -> Result<String> {
+        let tokens = self.flush_with_tokens()?;
+        Ok(self.join_token_text(&tokens))
+    }
+
+    /// Token-level companion to [`Self::flush`]. Every emitted token is
+    /// included; language-tag tokens are not stripped.
+    pub fn flush_with_tokens(&mut self) -> Result<Vec<TokenInfo>> {
+        if self.stream_finished {
+            return Ok(Vec::new());
+        }
+        let mut emitted = Vec::new();
+        if !self.audio_buffer.is_empty() {
+            // `transcribe_chunk` emits at most one full window per call, so a
+            // large buffer can still hold several. Drain those, then one
+            // zero-padded tail (shorter than `chunk_size`).
+            loop {
+                match self.emit_full_chunk()? {
+                    Some(tokens) => emitted.extend(tokens),
+                    None => break,
+                }
+            }
+            loop {
+                match self.emit_partial_tail()? {
+                    Some(tokens) => emitted.extend(tokens),
+                    None => break,
+                }
+            }
+        }
+        self.stream_finished = true;
+        Ok(emitted)
+    }
+
+    fn join_token_text(&self, tokens: &[TokenInfo]) -> String {
         let mut result = String::new();
-        for t in &tokens {
+        for t in tokens {
             if t.id < self.vocab_size && !self.lang_tag_ids.contains(&t.id) {
                 result.push_str(&t.text);
             }
         }
-        Ok(result)
+        result
     }
 
     /// Streaming companion to [`Self::transcribe_chunk`] returning per-token
     /// information (id, decoded text, log-probability) instead of a joined
     /// string. Every emitted token is included; language-tag tokens (e.g.
     /// `<en-US>`) are NOT stripped, so callers can inspect or filter them.
-    pub fn transcribe_chunk_with_tokens(
-        &mut self,
-        audio_chunk: &[f32],
-    ) -> Result<Vec<TokenInfo>> {
+    pub fn transcribe_chunk_with_tokens(&mut self, audio_chunk: &[f32]) -> Result<Vec<TokenInfo>> {
         self.process_chunk(audio_chunk)
     }
 
-    /// Shared streaming decode: buffers audio, runs the encoder/decoder for any
+    /// Shared streaming decode: buffers audio, runs the encoder/decoder for one
     /// ready chunk, accumulates token ids, and returns this call's emitted
     /// tokens. `transcribe_chunk` filters + joins these into a string.
+    ///
+    /// Still emits at most one full chunk per call. A tail shorter than
+    /// `chunk_size` is left buffered for [`Self::flush`].
     fn process_chunk(&mut self, audio_chunk: &[f32]) -> Result<Vec<TokenInfo>> {
-        // Append raw audio to buffer
+        if self.stream_finished {
+            return Ok(Vec::new());
+        }
         self.audio_buffer.extend_from_slice(audio_chunk);
+        Ok(self.emit_full_chunk()?.unwrap_or_default())
+    }
 
-        // Calculate how many mel frames we can produce from buffered audio
-        // mel_frames = 1 + (audio_len + 2*pad - win_length) / hop_length
-        // For center=true padding, we need at least win_length samples to get 1 frame
+    /// One full streaming chunk, or `None` when fewer than `chunk_size` new
+    /// mel frames are buffered. Encoder length stays `pre_encode_cache + chunk_size`.
+    fn emit_full_chunk(&mut self) -> Result<Option<Vec<TokenInfo>>> {
         let total_audio = self.audio_buffer.len();
         if total_audio < WIN_LENGTH {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
-        // Compute mel spectrogram over the ENTIRE audio buffer
+        let t_mel = self.timing_start();
         let full_mel = self.compute_mel_spectrogram(&self.audio_buffer)?;
+        self.add_mel_ns(t_mel);
         let total_mel_frames = full_mel.shape()[1];
 
-        // Calculate how many mel frames correspond to processed audio
-        // Each chunk_size mel frames = chunk_size * HOP_LENGTH audio samples
         let processed_mel_frames = self.audio_processed / HOP_LENGTH;
-
-        // Check if we have enough NEW frames to process a chunk
         let available_new_frames = total_mel_frames.saturating_sub(processed_mel_frames);
         if available_new_frames < self.chunk_size {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
-        // Build encoder input chunk
+        let main_start = processed_mel_frames;
+        let mel_chunk = self.build_mel_chunk(&full_mel, main_start, self.chunk_size)?;
+        let expected_size = (self.pre_encode_cache + self.chunk_size) as i64;
+        let tokens = self.run_streaming_step(&mel_chunk, expected_size, self.chunk_size)?;
+        Ok(Some(tokens))
+    }
+
+    /// Zero-pad the unprocessed tail to `chunk_size` and run one step.
+    /// `None` when no frames remain. Length matches the offline last chunk.
+    fn emit_partial_tail(&mut self) -> Result<Option<Vec<TokenInfo>>> {
+        if self.audio_buffer.is_empty() {
+            return Ok(None);
+        }
+
+        let t_mel = self.timing_start();
+        let full_mel = self.compute_mel_spectrogram(&self.audio_buffer)?;
+        self.add_mel_ns(t_mel);
+        let total_mel_frames = full_mel.shape()[1];
+        let main_start = self.audio_processed / HOP_LENGTH;
+        let remaining = total_mel_frames.saturating_sub(main_start);
+        let main_len = remaining.min(self.chunk_size);
+        let Some(chunk_length) = flush_tail_length(self.pre_encode_cache, main_len) else {
+            return Ok(None);
+        };
+
+        let mel_chunk = self.build_mel_chunk(&full_mel, main_start, main_len)?;
+        let tokens = self.run_streaming_step(&mel_chunk, chunk_length, main_len)?;
+        Ok(Some(tokens))
+    }
+
+    /// Mel tensor `[1, N_MELS, pre_encode_cache + chunk_size]`. Unfilled frames
+    /// stay zero, which is the offline last-chunk pad. `main_len` frames are
+    /// copied starting at `main_start`.
+    fn build_mel_chunk(
+        &self,
+        full_mel: &Array2<f32>,
+        main_start: usize,
+        main_len: usize,
+    ) -> Result<Array3<f32>> {
         let expected_size = self.pre_encode_cache + self.chunk_size;
         let mut chunk_data = vec![0.0f32; N_MELS * expected_size];
+        let total_mel_frames = full_mel.shape()[1];
+        let main_len = main_len.min(self.chunk_size);
+        let copy_n = main_len.min(total_mel_frames.saturating_sub(main_start));
 
-        // Determine the mel frame range for this chunk
-        let is_first_chunk = self.chunk_idx == 0;
-        let main_start = processed_mel_frames;
-        let _main_end = main_start + self.chunk_size;
-
-        if is_first_chunk {
-            // First chunk: zero-pad for pre-encode cache
-            for f in 0..self.chunk_size.min(total_mel_frames) {
+        if self.chunk_idx == 0 {
+            for f in 0..copy_n {
                 for m in 0..N_MELS {
-                    chunk_data[m * expected_size + self.pre_encode_cache + f] = full_mel[[m, f]];
+                    chunk_data[m * expected_size + self.pre_encode_cache + f] =
+                        full_mel[[m, main_start + f]];
                 }
             }
         } else {
-            // Subsequent chunks: include pre-encode cache from previous frames
             let cache_start = main_start.saturating_sub(self.pre_encode_cache);
             let cache_frames = main_start - cache_start;
             let cache_offset = self.pre_encode_cache - cache_frames;
-
-            // Fill pre-encode cache
             for f in 0..cache_frames {
                 for m in 0..N_MELS {
                     chunk_data[m * expected_size + cache_offset + f] =
                         full_mel[[m, cache_start + f]];
                 }
             }
-
-            // Fill main chunk
-            for f in 0..self.chunk_size.min(total_mel_frames - main_start) {
+            for f in 0..copy_n {
                 for m in 0..N_MELS {
                     chunk_data[m * expected_size + self.pre_encode_cache + f] =
                         full_mel[[m, main_start + f]];
@@ -899,23 +1157,44 @@ impl Nemotron {
             }
         }
 
-        let mel_chunk = Array3::from_shape_vec((1, N_MELS, expected_size), chunk_data)
-            .map_err(|e| Error::Model(format!("Failed to create mel chunk: {e}")))?;
+        Array3::from_shape_vec((1, N_MELS, expected_size), chunk_data)
+            .map_err(|e| Error::Model(format!("Failed to create mel chunk: {e}")))
+    }
 
+    fn run_streaming_step(
+        &mut self,
+        mel_chunk: &Array3<f32>,
+        chunk_length: i64,
+        advance_frames: usize,
+    ) -> Result<Vec<TokenInfo>> {
+        let t_enc = self.timing_start();
         let (encoded, enc_len, new_cache) = {
-            let mut model = self.model.lock().map_err(|e| {
-                Error::Model(format!("Failed to acquire model lock: {e}"))
-            })?;
+            let mut model = self
+                .model
+                .lock()
+                .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
             model.run_encoder(
-                &mel_chunk,
-                expected_size as i64,
+                mel_chunk,
+                chunk_length,
                 &self.encoder_cache,
                 self.prompt_index,
             )?
         };
+        self.add_encoder_ns(t_enc);
         self.encoder_cache = new_cache;
 
+        let t_dec = self.timing_start();
         let tokens = self.decode_chunk_tokens(&encoded, enc_len as usize)?;
+        self.add_decoder_ns(t_dec);
+        self.commit_stream_tokens(&tokens);
+
+        self.audio_processed += advance_frames * HOP_LENGTH;
+        self.chunk_idx += 1;
+        self.trim_audio_buffer();
+        Ok(tokens)
+    }
+
+    fn commit_stream_tokens(&mut self, tokens: &[TokenInfo]) {
         // Store all emitted ids unfiltered; `get_transcript` strips lang tags
         // and out-of-vocab ids at read time. In beam mode the per-chunk best
         // path can change, so reset accumulated ids to the global best path
@@ -925,23 +1204,16 @@ impl Nemotron {
         } else {
             self.accumulated_tokens.extend(tokens.iter().map(|t| t.id));
         }
+    }
 
-        // Advance processed position
-        self.audio_processed += self.chunk_size * HOP_LENGTH;
-        self.chunk_idx += 1;
-
-        // Trim audio buffer to keep memory bounded
-        // Keep enough for pre-encode cache context
+    fn trim_audio_buffer(&mut self) {
         let keep_samples = (self.pre_encode_cache + self.chunk_size) * HOP_LENGTH + WIN_LENGTH;
         if self.audio_buffer.len() > keep_samples * 2 {
             let remove = self.audio_buffer.len() - keep_samples;
-            // Adjust processed counter since we're removing from the start
             let actual_remove = remove.min(self.audio_processed);
             self.audio_buffer.drain(0..actual_remove);
             self.audio_processed -= actual_remove;
         }
-
-        Ok(tokens)
     }
 
     fn decode_chunk_tokens(
@@ -978,12 +1250,10 @@ impl Nemotron {
                 .model
                 .lock()
                 .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
-            let mut decoder = |frame: &Array3<f32>,
-                               last_token: i32,
-                               s1: &Array3<f32>,
-                               s2: &Array3<f32>| {
-                model.run_decoder(frame, last_token, s1, s2)
-            };
+            let mut decoder =
+                |frame: &Array3<f32>, last_token: i32, s1: &Array3<f32>, s2: &Array3<f32>| {
+                    model.run_decoder(frame, last_token, s1, s2)
+                };
             decode_rnnt_beam(
                 encoder_out,
                 0,
@@ -1028,9 +1298,10 @@ impl Nemotron {
 
         // Lock the model once for the entire decode loop to minimise
         // lock acquire/release overhead (many decoder steps per chunk).
-        let mut model = self.model.lock().map_err(|e| {
-            Error::Model(format!("Failed to acquire model lock: {e}"))
-        })?;
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
 
         for t in 0..enc_frames {
             let frame = encoder_out.slice(s![0, .., t]).to_owned();
@@ -1040,12 +1311,8 @@ impl Nemotron {
                 .to_owned();
 
             for _ in 0..max_symbols_per_step {
-                let (logits, new_state_1, new_state_2) = model.run_decoder(
-                    &frame,
-                    self.last_token,
-                    &self.state_1,
-                    &self.state_2,
-                )?;
+                let (logits, new_state_1, new_state_2) =
+                    model.run_decoder(&frame, self.last_token, &self.state_1, &self.state_2)?;
 
                 let (max_idx, max_val) =
                     crate::tensor_utils::argmax_f32_iter(logits.iter().copied());
@@ -1099,6 +1366,18 @@ mod tests {
     }
 
     #[test]
+    fn flush_tail_length_matches_offline_last_chunk() {
+        // No model-free `Nemotron` constructor: empty-buffer and idempotent
+        // flush are weight-gated. This checks the length the tail step passes
+        // to the encoder (`pre_encode_cache + remaining_frames`).
+        assert_eq!(flush_tail_length(9, 0), None);
+        assert_eq!(flush_tail_length(9, 15), Some(24));
+        // A full chunk uses the same sum, which is `expected_size` in
+        // `emit_full_chunk` (default cache 9 + 56 mel frames).
+        assert_eq!(flush_tail_length(9, 56), Some(65));
+    }
+
+    #[test]
     fn frame_to_seconds_is_eighty_ms() {
         // Guards against accidental drift in the subsampling/hop/sample-rate
         // constants that feed per-token timestamp timing.
@@ -1141,6 +1420,9 @@ mod tests {
         let total: f32 = (0..logits.len())
             .map(|idx| log_softmax_at(&logits, idx, m).exp())
             .sum();
-        assert!((total - 1.0).abs() < 1e-5, "probabilities must sum to 1, got {total}");
+        assert!(
+            (total - 1.0).abs() < 1e-5,
+            "probabilities must sum to 1, got {total}"
+        );
     }
 }

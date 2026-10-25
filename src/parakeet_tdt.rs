@@ -6,7 +6,7 @@ use crate::decoding::DecodingStrategy;
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_tdt::ParakeetTDTModel;
-use crate::timestamps::{process_timestamps, rebuild_text, TimestampMode};
+use crate::timestamps::{TimestampMode, process_timestamps, rebuild_text};
 use crate::transcriber::Transcriber;
 use crate::vocab::Vocabulary;
 use std::path::{Path, PathBuf};

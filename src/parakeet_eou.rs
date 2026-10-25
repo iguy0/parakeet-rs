@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_eou::{EncoderCache, ParakeetEOUModel};
-use ndarray::{s, Array2, Array3};
+use ndarray::{Array2, Array3, s};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};

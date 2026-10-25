@@ -43,7 +43,11 @@
 //! - Channels: Mono (stereo will be converted automatically)
 //! - Bit Depth: 16-bit PCM or 32-bit float
 
+#[cfg(feature = "ark-asr")]
+pub mod ark_asr;
 mod audio;
+#[cfg(feature = "cohere")]
+pub mod cohere;
 mod config;
 mod decoder;
 mod decoder_tdt;
@@ -51,10 +55,18 @@ mod decoding;
 mod error;
 mod execution;
 mod model;
+#[cfg(feature = "ark-asr")]
+mod model_ark;
+#[cfg(feature = "cohere")]
+mod model_cohere;
 mod model_eou;
+#[cfg(feature = "multitalker")]
+mod model_multitalker;
 mod model_nemotron;
 mod model_tdt;
 mod model_unified;
+#[cfg(feature = "multitalker")]
+pub mod multitalker;
 mod nemotron;
 mod parakeet;
 mod parakeet_eou;
@@ -62,18 +74,6 @@ mod parakeet_tdt;
 mod parakeet_unified;
 #[cfg(feature = "sortformer")]
 pub mod sortformer;
-#[cfg(feature = "multitalker")]
-mod model_multitalker;
-#[cfg(feature = "multitalker")]
-pub mod multitalker;
-#[cfg(feature = "cohere")]
-mod model_cohere;
-#[cfg(feature = "cohere")]
-pub mod cohere;
-#[cfg(feature = "ark-asr")]
-mod model_ark;
-#[cfg(feature = "ark-asr")]
-pub mod ark_asr;
 mod tensor_utils;
 mod timestamps;
 mod transcriber;
@@ -94,8 +94,8 @@ pub use config::{
 
 pub use decoder::{ParakeetDecoder, TimedToken, TranscriptionResult};
 pub use decoding::{
-    decode_ctc_beam, decode_rnnt_beam, decode_tdt_beam, BeamConfig, DecodingStrategy,
-    RnntBeamOutput, RnntHypothesis, TdtBeamOutput, TdtHypothesis,
+    BeamConfig, DecodingStrategy, RnntBeamOutput, RnntHypothesis, TdtBeamOutput, TdtHypothesis,
+    decode_ctc_beam, decode_ctc_beam_view, decode_rnnt_beam, decode_tdt_beam,
 };
 pub use model::ParakeetModel;
 pub use model_eou::ParakeetEOUModel;
@@ -106,10 +106,12 @@ pub use parakeet_eou::{ParakeetEOU, ParakeetEOUHandle};
 pub use parakeet_unified::{ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig};
 
 #[cfg(feature = "multitalker")]
-pub use multitalker::{LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript, WordTimestamp};
+pub use multitalker::{
+    DiarStrategy, LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript, WordTimestamp,
+};
 
 #[cfg(feature = "cohere")]
 pub use cohere::CohereASR;
 
 #[cfg(feature = "ark-asr")]
-pub use ark_asr::ArkAsr;
+pub use ark_asr::{ArkAsr, ArkLongAudioPolicy};

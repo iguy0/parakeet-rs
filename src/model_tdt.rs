@@ -1,4 +1,4 @@
-use crate::decoding::{decode_tdt_beam, BeamConfig, DecodingStrategy};
+use crate::decoding::{BeamConfig, DecodingStrategy, decode_tdt_beam};
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use ndarray::{Array1, Array2, Array3};
@@ -155,8 +155,10 @@ impl ParakeetTDTModel {
         // TDT encoder outputs [batch, encoder_dim, time] directly
         let encoder_array =
             crate::tensor_utils::extract_3d_f32(&outputs["outputs"], "encoder output")?;
-        let encoded_len =
-            crate::tensor_utils::extract_scalar_i64(&outputs["encoded_lengths"], "encoder lengths")?;
+        let encoded_len = crate::tensor_utils::extract_scalar_i64(
+            &outputs["encoded_lengths"],
+            "encoder lengths",
+        )?;
 
         Ok((encoder_array, encoded_len))
     }
@@ -171,12 +173,10 @@ impl ParakeetTDTModel {
         let blank_id = vocab_size - 1;
         let encoder_len = encoder_len as usize;
 
-        let mut decoder = |frame: &Array3<f32>,
-                           last_token: i32,
-                           state_1: &Array3<f32>,
-                           state_2: &Array3<f32>| {
-            self.run_decoder(frame, last_token, state_1, state_2)
-        };
+        let mut decoder =
+            |frame: &Array3<f32>, last_token: i32, state_1: &Array3<f32>, state_2: &Array3<f32>| {
+                self.run_decoder(frame, last_token, state_1, state_2)
+            };
 
         let output = decode_tdt_beam(
             encoder_out,
@@ -301,10 +301,7 @@ impl ParakeetTDTModel {
     }
 }
 
-fn extract_state(
-    output: &ort::value::DynValue,
-    name: &str,
-) -> Result<Array3<f32>> {
+fn extract_state(output: &ort::value::DynValue, name: &str) -> Result<Array3<f32>> {
     let (shape, data) = output
         .try_extract_tensor::<f32>()
         .map_err(|e| Error::Model(format!("Failed to extract {name}: {e}")))?;

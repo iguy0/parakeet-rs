@@ -104,7 +104,19 @@ pub fn eou_dir() -> PathBuf {
     resolve("PARAKEET_EOU_DIR", "models/realtime-eou-120m")
 }
 pub fn cohere_dir() -> PathBuf {
-    resolve("PARAKEET_COHERE_DIR", "models/cohere-transcribe-03-2026-int8")
+    resolve(
+        "PARAKEET_COHERE_DIR",
+        "models/cohere-transcribe-03-2026-int8",
+    )
+}
+pub fn ark_dir() -> PathBuf {
+    resolve("PARAKEET_ARK_DIR", "models/ark-asr-0.6b-int8-onnx")
+}
+pub fn granite_dir() -> PathBuf {
+    resolve(
+        "PARAKEET_GRANITE_DIR",
+        "models/granite-speech-5.0-470m-turboctc-onnx",
+    )
 }
 
 pub fn ctc_available() -> bool {
@@ -113,16 +125,19 @@ pub fn ctc_available() -> bool {
         && d.join("tokenizer.json").exists()
         && std::fs::read_dir(&d)
             .map(|rd| {
-                rd.flatten().any(|e| {
-                    e.path().extension().and_then(|x| x.to_str()) == Some("onnx")
-                })
+                rd.flatten()
+                    .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("onnx"))
             })
             .unwrap_or(false)
 }
 pub fn tdt_available() -> bool {
     dir_has(
         &tdt_dir(),
-        &["encoder-model.onnx", "decoder_joint-model.onnx", "vocab.txt"],
+        &[
+            "encoder-model.onnx",
+            "decoder_joint-model.onnx",
+            "vocab.txt",
+        ],
     )
 }
 pub fn unified_available() -> bool {
@@ -132,7 +147,10 @@ pub fn unified_available() -> bool {
     )
 }
 pub fn eou_available() -> bool {
-    dir_has(&eou_dir(), &["encoder.onnx", "decoder_joint.onnx", "tokenizer.json"])
+    dir_has(
+        &eou_dir(),
+        &["encoder.onnx", "decoder_joint.onnx", "tokenizer.json"],
+    )
 }
 pub fn cohere_available() -> bool {
     let d = cohere_dir();
@@ -158,6 +176,34 @@ pub fn cohere_available() -> bool {
         "decoder_model_merged_fp16.onnx",
     ];
     enc.iter().any(|f| d.join(f).exists()) && dec.iter().any(|f| d.join(f).exists())
+}
+
+pub fn ark_available() -> bool {
+    let d = ark_dir();
+    d.join("runtime_manifest.json").is_file()
+        || d.join("model").join("runtime_manifest.json").is_file()
+}
+
+/// True when the Granite TurboCTC directory has a tokenizer and an ONNX graph
+/// in the layouts [`parakeet_rs::Parakeet::from_pretrained`] searches
+/// (directory root or `onnx/`).
+pub fn granite_available() -> bool {
+    let d = granite_dir();
+    if !d.is_dir() {
+        return false;
+    }
+    let tok = d.join("tokenizer.json").is_file() || d.join("onnx").join("tokenizer.json").is_file();
+    let graphs = [
+        "model.onnx",
+        "model_fp16.onnx",
+        "model_int8.onnx",
+        "model_q4.onnx",
+        "onnx/model.onnx",
+        "onnx/model_fp16.onnx",
+        "onnx/model_int8.onnx",
+        "onnx/model_q4.onnx",
+    ];
+    tok && graphs.iter().any(|f| d.join(f).is_file())
 }
 
 /// Emit a standard skip notice (visible with `cargo test -- --nocapture`).
@@ -216,13 +262,21 @@ pub fn discover_samples() -> Vec<Sample> {
             }
         }
         if let (Some(wav), Some(transcript)) = (wav, transcript) {
-            out.push(Sample { name, wav, transcript });
+            out.push(Sample {
+                name,
+                wav,
+                transcript,
+            });
         }
     }
     // Optional comma-separated allow-list (e.g. `PARAKEET_BENCH_SAMPLES=smoke,committee`)
     // to keep slow configurations (low-latency streaming presets) tractable.
     if let Ok(filter) = std::env::var("PARAKEET_BENCH_SAMPLES") {
-        let wanted: Vec<&str> = filter.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let wanted: Vec<&str> = filter
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
         if !wanted.is_empty() {
             out.retain(|s| wanted.contains(&s.name.as_str()));
         }
@@ -239,8 +293,8 @@ pub fn sample_named(name: &str) -> Option<Sample> {
 /// Load a WAV as 16 kHz mono f32. Returns `(samples, sample_rate)`.
 /// Panics on non-16 kHz input (every sample clip is already 16 kHz).
 pub fn load_wav_mono_16k(path: &Path) -> (Vec<f32>, u32) {
-    let mut reader = hound::WavReader::open(path)
-        .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    let mut reader =
+        hound::WavReader::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let spec = reader.spec();
 
     let mut audio: Vec<f32> = match spec.sample_format {
@@ -303,7 +357,8 @@ fn line_is_header(line: &str) -> bool {
     let mut toks = line.split_whitespace();
     match (toks.next(), toks.next()) {
         (Some(s), Some(id)) if s.eq_ignore_ascii_case("speaker") => {
-            if id.trim_end_matches(|c: char| !c.is_alphanumeric())
+            if id
+                .trim_end_matches(|c: char| !c.is_alphanumeric())
                 .chars()
                 .all(|c| c.is_ascii_digit())
             {
@@ -320,14 +375,23 @@ fn line_is_header(line: &str) -> bool {
 fn is_timestamp(tok: &str) -> bool {
     let t = tok.trim();
     let parts: Vec<&str> = t.split(':').collect();
-    parts.len() >= 2 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    parts.len() >= 2
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Normalize text for WER: lowercase, drop punctuation, collapse whitespace.
 pub fn normalize_words(text: &str) -> Vec<String> {
     text.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .map(|w| w.to_string())
@@ -405,7 +469,11 @@ const FRAME_STEP: f32 = 0.01; // 10 ms
 /// Parse `M:SS` / `H:MM:SS` into seconds.
 fn parse_clock(tok: &str) -> Option<f32> {
     let parts: Vec<&str> = tok.trim().split(':').collect();
-    if parts.len() < 2 || parts.iter().any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit())) {
+    if parts.len() < 2
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()))
+    {
         return None;
     }
     let mut secs = 0f32;
@@ -446,7 +514,11 @@ pub fn parse_reference_turns(raw: &str, audio_secs: f32) -> Vec<DiarSegment> {
             audio_secs.max(start)
         };
         if end > start {
-            turns.push(DiarSegment { speaker: spk, start, end });
+            turns.push(DiarSegment {
+                speaker: spk,
+                start,
+                end,
+            });
         }
     }
     turns
@@ -670,7 +742,10 @@ pub fn ep_skip_if_unavailable(test: &str) -> bool {
         "webgpu" => false,
         #[cfg(not(feature = "cuda"))]
         "cuda" => {
-            skip(test, &format!("{EP_ENV}=cuda requires `cargo test --features cuda`"));
+            skip(
+                test,
+                &format!("{EP_ENV}=cuda requires `cargo test --features cuda`"),
+            );
             true
         }
         #[cfg(feature = "cuda")]
@@ -785,8 +860,16 @@ pub fn execution_config() -> parakeet_rs::ExecutionConfig {
     execution_config_for_ep(&requested_ep())
 }
 
+/// Column layout for new `samples/asr_report.csv` files.
+///
+/// `intra_threads` is appended at the end (the intra-op thread count from
+/// [`execution_config`], which is 4 unless that helper changes). `append_csv_row`
+/// writes this header only when the file is created. An existing report whose
+/// header predates the column is left unchanged so older rows stay parseable;
+/// newer rows still carry `intra_threads` as a trailing integer. A reader of a
+/// mixed file should use that last field when the header does not name it.
 pub const ASR_CSV_HEADER: &str = "run_id,label,sample,model,mode,decoding,ep,\
-audio_secs,proc_secs,rtf,wer,cer";
+audio_secs,proc_secs,rtf,wer,cer,intra_threads";
 
 /// Record one ASR result to `samples/asr_report.csv`, print a row, and return WER.
 #[allow(clippy::too_many_arguments)]
@@ -803,9 +886,14 @@ pub fn record_asr(
 ) -> f32 {
     let w = wer(reference, hyp);
     let c = cer(reference, hyp);
-    let rtf = if proc_secs > 1e-6 { audio_secs / proc_secs } else { 0.0 };
+    let rtf = if proc_secs > 1e-6 {
+        audio_secs / proc_secs
+    } else {
+        0.0
+    };
+    let intra_threads = execution_config().intra_threads;
     eprintln!(
-        "  {:<26} {:<9} {:<6} {:<6} RTF {:>6.1}x  WER {:>5.1}%  CER {:>5.1}%",
+        "  {:<26} {:<9} {:<6} {:<6} RTF {:>6.1}x  WER {:>5.1}%  CER {:>5.1}%  threads {intra_threads}",
         sample,
         mode,
         decoding,
@@ -819,7 +907,7 @@ pub fn record_asr(
         ASR_CSV_HEADER,
         &format!(
             "{},{},{sample},{model},{mode},{decoding},{ep},{audio_secs:.2},{proc_secs:.3},\
-{rtf:.2},{:.4},{:.4}",
+{rtf:.2},{:.4},{:.4},{intra_threads}",
             run_id(),
             bench_label(),
             w,
@@ -849,12 +937,28 @@ mod unit {
     fn der_zero_with_relabeled_speakers() {
         // Reference: spk0 [0,1), spk1 [1,2). Hypothesis identical but ids swapped.
         let reference = vec![
-            DiarSegment { speaker: 0, start: 0.0, end: 1.0 },
-            DiarSegment { speaker: 1, start: 1.0, end: 2.0 },
+            DiarSegment {
+                speaker: 0,
+                start: 0.0,
+                end: 1.0,
+            },
+            DiarSegment {
+                speaker: 1,
+                start: 1.0,
+                end: 2.0,
+            },
         ];
         let hypothesis = vec![
-            DiarSegment { speaker: 7, start: 0.0, end: 1.0 },
-            DiarSegment { speaker: 3, start: 1.0, end: 2.0 },
+            DiarSegment {
+                speaker: 7,
+                start: 0.0,
+                end: 1.0,
+            },
+            DiarSegment {
+                speaker: 3,
+                start: 1.0,
+                end: 2.0,
+            },
         ];
         let m = diarization_metrics(&reference, &hypothesis, 2.0);
         assert!(m.der < 1e-6, "der={}", m.der);
@@ -864,11 +968,23 @@ mod unit {
     #[test]
     fn der_counts_missed_and_confusion() {
         let reference = vec![
-            DiarSegment { speaker: 0, start: 0.0, end: 1.0 },
-            DiarSegment { speaker: 1, start: 1.0, end: 2.0 },
+            DiarSegment {
+                speaker: 0,
+                start: 0.0,
+                end: 1.0,
+            },
+            DiarSegment {
+                speaker: 1,
+                start: 1.0,
+                end: 2.0,
+            },
         ];
         // Hyp: correct first half, silence second half -> 50% missed.
-        let hypothesis = vec![DiarSegment { speaker: 5, start: 0.0, end: 1.0 }];
+        let hypothesis = vec![DiarSegment {
+            speaker: 5,
+            start: 0.0,
+            end: 1.0,
+        }];
         let m = diarization_metrics(&reference, &hypothesis, 2.0);
         assert!((m.der - 0.5).abs() < 0.02, "der={}", m.der);
         assert!(m.missed > 0.4, "missed={}", m.missed);

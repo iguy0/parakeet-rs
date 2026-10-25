@@ -5,7 +5,7 @@ use crate::decoding::DecodingStrategy;
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model::ParakeetModel;
-use crate::timestamps::{process_timestamps, rebuild_text, TimestampMode};
+use crate::timestamps::{TimestampMode, process_timestamps, rebuild_text};
 use crate::transcriber::Transcriber;
 use std::path::{Path, PathBuf};
 
@@ -198,8 +198,13 @@ impl Transcriber for Parakeet {
                 )?
             }
             DecodingStrategy::Beam(config) => {
-                let logits = self.model.forward(features)?;
-                let text = self.decoder.decode_with_beam_config(&logits, &config)?;
+                let model = &mut self.model;
+                let decoder = &self.decoder;
+                let text = model.with_logits(features, |frames, vocab, data| {
+                    let logits = ndarray::ArrayView2::from_shape((frames, vocab), data)
+                        .map_err(|e| Error::Model(format!("Failed to view logits: {e}")))?;
+                    decoder.decode_with_beam_config_view(logits, &config)
+                })?;
                 TranscriptionResult {
                     text,
                     tokens: Vec::new(),

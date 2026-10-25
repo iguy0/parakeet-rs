@@ -13,6 +13,8 @@ pub struct ParakeetModel {
     config: ModelConfig,
     ctc_config: CtcConfig,
     has_attention_mask: bool,
+    /// First-forward metadata check has already run (warn at most once).
+    frame_ratio_checked: bool,
 }
 
 impl ParakeetModel {
@@ -43,24 +45,51 @@ impl ParakeetModel {
             config,
             ctc_config,
             has_attention_mask,
+            frame_ratio_checked: false,
         })
     }
+
     pub fn forward(&mut self, features: Array2<f32>) -> Result<Array2<f32>> {
-        let outputs = self.run_features(features)?;
-        let (time_steps_out, vocab_size, data) = extract_logits_view(&outputs)?;
-        Array2::from_shape_vec((time_steps_out, vocab_size), data.to_vec())
-            .map_err(|e| Error::Model(format!("Failed to create array: {e}")))
+        self.with_logits(features, |time_steps_out, vocab_size, data| {
+            Array2::from_shape_vec((time_steps_out, vocab_size), data.to_vec())
+                .map_err(|e| Error::Model(format!("Failed to create array: {e}")))
+        })
+    }
+
+    /// Run the encoder and borrow the logit buffer for `f`.
+    ///
+    /// `f` receives `(frames, vocab, row-major logits)` while the session output
+    /// is still alive, so callers can decode without copying a `T x V` matrix.
+    /// [`Self::forward`] is unchanged for callers that want an owned array.
+    pub fn with_logits<R>(
+        &mut self,
+        features: Array2<f32>,
+        f: impl FnOnce(usize, usize, &[f32]) -> Result<R>,
+    ) -> Result<R> {
+        let feature_frames = features.shape()[0];
+        let (result, logit_frames) = {
+            let outputs = self.run_features(features)?;
+            let (time_steps_out, vocab_size, data) = extract_logits_view(&outputs)?;
+            (f(time_steps_out, vocab_size, data), time_steps_out)
+        };
+        self.note_frame_ratio(feature_frames, logit_frames);
+        result
     }
 
     /// Greedy argmax per encoder frame without materializing the full logit tensor.
     pub fn forward_frame_ids(&mut self, features: Array2<f32>) -> Result<Vec<u32>> {
-        let outputs = self.run_features(features)?;
-        let (time_steps_out, vocab_size, data) = extract_logits_view(&outputs)?;
-        let mut ids = Vec::with_capacity(time_steps_out);
-        for t in 0..time_steps_out {
-            let row = &data[t * vocab_size..(t + 1) * vocab_size];
-            ids.push(argmax_f32(row).0 as u32);
-        }
+        let feature_frames = features.shape()[0];
+        let (ids, logit_frames) = {
+            let outputs = self.run_features(features)?;
+            let (time_steps_out, vocab_size, data) = extract_logits_view(&outputs)?;
+            let mut ids = Vec::with_capacity(time_steps_out);
+            for t in 0..time_steps_out {
+                let row = &data[t * vocab_size..(t + 1) * vocab_size];
+                ids.push(argmax_f32(row).0 as u32);
+            }
+            (ids, time_steps_out)
+        };
+        self.note_frame_ratio(feature_frames, logit_frames);
         Ok(ids)
     }
 
@@ -107,6 +136,30 @@ impl ParakeetModel {
     pub fn pad_token_id(&self) -> usize {
         self.config.pad_token_id
     }
+
+    /// Warn once if metadata stride and the first forward's frame counts disagree.
+    fn note_frame_ratio(&mut self, feature_frames: usize, logit_frames: usize) {
+        if self.frame_ratio_checked {
+            return;
+        }
+        self.frame_ratio_checked = true;
+        if logit_frames == 0 || feature_frames == 0 {
+            return;
+        }
+        if !self
+            .ctc_config
+            .logit_frame_ratio_disagrees(feature_frames, logit_frames)
+        {
+            return;
+        }
+        let stack = self.ctc_config.frontend.stack_factor.max(1);
+        let sub = self.ctc_config.encoder_subsample.max(1);
+        let observed = feature_frames as f64 / logit_frames as f64;
+        eprintln!(
+            "parakeet-rs: CTC metadata frame ratio disagrees with the first forward by more than one frame: feature_frames={feature_frames} logit_frames={logit_frames} feature/logit={observed:.3} encoder_subsample={sub} stack_factor={stack} product={} (model input is already stacked; expected feature/logit about {sub})",
+            stack * sub
+        );
+    }
 }
 
 fn ctc_config_from_session(session: &Session) -> CtcConfig {
@@ -126,9 +179,7 @@ fn ctc_config_from_session(session: &Session) -> CtcConfig {
     CtcConfig::from_metadata(&keys)
 }
 
-fn extract_logits_view<'a>(
-    outputs: &'a SessionOutputs<'_>,
-) -> Result<(usize, usize, &'a [f32])> {
+fn extract_logits_view<'a>(outputs: &'a SessionOutputs<'_>) -> Result<(usize, usize, &'a [f32])> {
     let logits_value = &outputs["logits"];
     let (shape, data) = logits_value
         .try_extract_tensor::<f32>()

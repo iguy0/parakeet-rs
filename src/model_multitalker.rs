@@ -94,6 +94,20 @@ impl MultitalkerModel {
         })
     }
 
+    /// Last dimension of the joint `outputs` tensor (vocabulary classes plus blank),
+    /// when that dimension is a static integer greater than 1.
+    pub(crate) fn decoder_output_classes(&self) -> Option<usize> {
+        let shape = self
+            .decoder_joint
+            .outputs()
+            .iter()
+            .find(|o| o.name() == "outputs")?
+            .dtype()
+            .tensor_shape()?;
+        let dim = shape.last().copied()?;
+        (dim > 1).then_some(dim as usize)
+    }
+
     /// Run encoder with cache-aware streaming and speaker target injection.
     ///
     /// Compared to NemotronModel::run_encoder(), this adds two extra inputs:

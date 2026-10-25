@@ -2,13 +2,13 @@
 //!
 //! Greedy decoding remains the default. Opt in to beam search via [`DecodingStrategy`].
 
+mod ctc_beam;
 mod rnnt_beam;
 mod tdt_beam;
-mod ctc_beam;
 
-pub use rnnt_beam::{decode_rnnt_beam, RnntBeamOutput, RnntHypothesis};
-pub use tdt_beam::{decode_tdt_beam, TdtBeamOutput, TdtHypothesis};
-pub use ctc_beam::decode_ctc_beam;
+pub use ctc_beam::{decode_ctc_beam, decode_ctc_beam_view};
+pub use rnnt_beam::{RnntBeamOutput, RnntHypothesis, decode_rnnt_beam};
+pub use tdt_beam::{TdtBeamOutput, TdtHypothesis, decode_tdt_beam};
 
 /// Beam search hyperparameters (defaults tuned from parakeet-mlx).
 ///
@@ -22,6 +22,7 @@ pub use ctc_beam::decode_ctc_beam;
 /// | `patience`            | no (unused)    | yes          | no (unused)  |
 /// | `max_symbols_per_step`| yes            | yes          | no (unused)  |
 /// | `duration_reward`     | no (TDT-only)  | yes          | no (TDT-only)|
+/// | `frame_topk`          | no (unused)    | no (unused)  | yes          |
 ///
 /// Notes:
 /// - `patience` controls the finished-hypothesis pool size only in the TDT
@@ -32,6 +33,8 @@ pub use ctc_beam::decode_ctc_beam;
 ///   prefix beam ranks by total prefix log-probability and ignores it.
 /// - `duration_reward` only weights TDT duration vs token log-probs; it is read
 ///   by the TDT decoder alone.
+/// - `frame_topk` caps how many labels CTC considers per frame. `0` keeps the
+///   historical choice (`beam_size`). Blank is always kept. RNNT and TDT ignore it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BeamConfig {
     /// Maximum hypotheses retained after pruning each step. Honored by all models.
@@ -44,6 +47,8 @@ pub struct BeamConfig {
     pub max_symbols_per_step: usize,
     /// TDT-only: weight for duration vs token log-probs in `[0, 1]`.
     pub duration_reward: f32,
+    /// CTC-only per-frame label cap. `0` means `beam_size` (previous behavior).
+    pub frame_topk: usize,
 }
 
 impl Default for BeamConfig {
@@ -61,6 +66,7 @@ impl BeamConfig {
             patience: 3.5,
             max_symbols_per_step: 10,
             duration_reward: 0.67,
+            frame_topk: 0,
         }
     }
 
@@ -70,6 +76,8 @@ impl BeamConfig {
     }
 
     /// Defaults for Parakeet CTC decoding (`beam_size` only; other fields unused).
+    ///
+    /// `frame_topk` is `0`, so each frame still considers `beam_size` labels.
     pub fn default_ctc() -> Self {
         Self {
             beam_size: 5,
@@ -77,6 +85,7 @@ impl BeamConfig {
             patience: 1.0,
             max_symbols_per_step: 10,
             duration_reward: 0.67,
+            frame_topk: 0,
         }
     }
 }

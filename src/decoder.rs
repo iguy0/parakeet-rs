@@ -1,8 +1,8 @@
 use crate::config::CtcConfig;
-use crate::decoding::{decode_ctc_beam, BeamConfig};
+use crate::decoding::{BeamConfig, decode_ctc_beam_view};
 use crate::error::{Error, Result};
 use crate::tensor_utils::argmax_f32;
-use ndarray::Array2;
+use ndarray::{Array2, ArrayView2};
 use std::path::Path;
 
 // Token with its timestamp information
@@ -230,7 +230,16 @@ impl ParakeetDecoder {
         logits: &Array2<f32>,
         config: &BeamConfig,
     ) -> Result<String> {
-        let collapsed = decode_ctc_beam(logits, self.blank_id, config);
+        self.decode_with_beam_config_view(logits.view(), config)
+    }
+
+    /// CTC prefix beam search over a borrowed `[time, vocab]` logit view.
+    pub fn decode_with_beam_config_view(
+        &self,
+        logits: ArrayView2<f32>,
+        config: &BeamConfig,
+    ) -> Result<String> {
+        let collapsed = decode_ctc_beam_view(logits, self.blank_id, config);
         let collapsed = self.apply_token_offset(&collapsed);
         let text = self
             .tokenizer

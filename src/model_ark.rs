@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
-use ndarray::{s, Array1, Array2, Array3, Array4};
+use ndarray::{Array1, Array2, Array3, Array4, s};
 use ort::session::Session;
 use ort::value::TensorRef;
 use serde::Deserialize;
@@ -246,9 +246,9 @@ impl ArkModel {
             self.config.manifest.audio_encoder_hidden_size,
         )?;
         let merged_ref = TensorRef::<f32>::from_array_view(merged.view())?;
-        let adapter_out =
-            self.adapter
-                .run(ort::inputs!("merged_audio_features" => merged_ref))?;
+        let adapter_out = self
+            .adapter
+            .run(ort::inputs!("merged_audio_features" => merged_ref))?;
         extract_array3(&adapter_out, "audio_embeddings")
     }
 
@@ -259,9 +259,10 @@ impl ArkModel {
         let seq = ids.len();
         let input_ids = Array2::from_shape_vec((1, seq), ids.to_vec())
             .map_err(|e| Error::Model(format!("Failed to shape input_ids: {e}")))?;
-        let session = self.embedding.as_mut().ok_or_else(|| {
-            Error::Config("no embedding table or embedding ONNX session".into())
-        })?;
+        let session = self
+            .embedding
+            .as_mut()
+            .ok_or_else(|| Error::Config("no embedding table or embedding ONNX session".into()))?;
         let input = TensorRef::<i64>::from_array_view(input_ids.view())?;
         let outputs = session.run(ort::inputs!("input_ids" => input))?;
         extract_array3(&outputs, "inputs_embeds")
@@ -269,7 +270,9 @@ impl ArkModel {
 
     pub(crate) fn embed_one(&mut self, id: i64, dest: &mut Array3<f32>) -> Result<()> {
         if dest.shape() != [1, 1, self.config.llm.hidden_size] {
-            return Err(Error::Model("step embedding buffer has the wrong shape".into()));
+            return Err(Error::Model(
+                "step embedding buffer has the wrong shape".into(),
+            ));
         }
         if let Some(table) = &self.embed_table {
             let row = table.row(id as usize)?;
@@ -330,8 +333,18 @@ fn scatter_cache_from_outputs(
     let inner = cache.inner.max(1);
     let mut seq_written = 0usize;
     for i in 0..cache.keys.len() {
-        seq_written = scatter_one(&outputs[key_names[i].as_str()], &mut cache.keys[i], start, inner)?;
-        scatter_one(&outputs[value_names[i].as_str()], &mut cache.values[i], start, inner)?;
+        seq_written = scatter_one(
+            &outputs[key_names[i].as_str()],
+            &mut cache.keys[i],
+            start,
+            inner,
+        )?;
+        scatter_one(
+            &outputs[value_names[i].as_str()],
+            &mut cache.values[i],
+            start,
+            inner,
+        )?;
     }
     cache.used = cache.used.max(start + seq_written);
     Ok(())
@@ -426,10 +439,7 @@ fn merge_audio_features(
         .map_err(|e| Error::Model(format!("Failed to reshape merged audio features: {e}")))
 }
 
-fn extract_array3(
-    outputs: &ort::session::SessionOutputs<'_>,
-    name: &str,
-) -> Result<Array3<f32>> {
+fn extract_array3(outputs: &ort::session::SessionOutputs<'_>, name: &str) -> Result<Array3<f32>> {
     let (shape, data) = outputs[name]
         .try_extract_tensor::<f32>()
         .map_err(|e| Error::Model(format!("Failed to extract {name}: {e}")))?;
@@ -489,9 +499,8 @@ fn resolve_asset_root(dir: &Path) -> Result<PathBuf> {
 fn load_manifest(root: &Path) -> Result<RuntimeManifest> {
     let path = root.join("runtime_manifest.json");
     let text = std::fs::read_to_string(&path)?;
-    serde_json::from_str(&text).map_err(|e| {
-        Error::Config(format!("Failed to parse {}: {e}", path.display()))
-    })
+    serde_json::from_str(&text)
+        .map_err(|e| Error::Config(format!("Failed to parse {}: {e}", path.display())))
 }
 
 fn load_llm_meta(root: &Path, llm_filename: &str) -> Result<LlmMeta> {
@@ -511,9 +520,8 @@ fn load_llm_meta(root: &Path, llm_filename: &str) -> Result<LlmMeta> {
     for path in &candidates {
         if path.is_file() {
             let text = std::fs::read_to_string(path)?;
-            return serde_json::from_str(&text).map_err(|e| {
-                Error::Config(format!("Failed to parse {}: {e}", path.display()))
-            });
+            return serde_json::from_str(&text)
+                .map_err(|e| Error::Config(format!("Failed to parse {}: {e}", path.display())));
         }
     }
     Err(Error::Config(format!(

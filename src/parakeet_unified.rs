@@ -1,12 +1,12 @@
 use crate::audio::{self, load_audio};
 use crate::config::PreprocessorConfig;
 use crate::decoder::{TimedToken, TranscriptionResult};
-use crate::decoding::{decode_rnnt_beam, BeamConfig, DecodingStrategy, RnntHypothesis};
+use crate::decoding::{BeamConfig, DecodingStrategy, RnntHypothesis, decode_rnnt_beam};
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_unified::{ParakeetUnifiedModel, UnifiedModelConfig};
 use crate::nemotron::SentencePieceVocab;
-use crate::timestamps::{process_timestamps, TimestampMode};
+use crate::timestamps::{TimestampMode, process_timestamps};
 use crate::transcriber::Transcriber;
 use ndarray::Array3;
 use std::path::Path;
@@ -184,7 +184,9 @@ impl ParakeetUnifiedHandle {
             win_length: WIN_LENGTH,
         };
 
-        let feature_cache = Arc::new(crate::audio::FeatureCache::from_config(&preprocessor_config));
+        let feature_cache = Arc::new(crate::audio::FeatureCache::from_config(
+            &preprocessor_config,
+        ));
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
@@ -196,10 +198,7 @@ impl ParakeetUnifiedHandle {
     }
 
     /// Backwards-compatible alias for [`ParakeetUnifiedHandle::from_pretrained`].
-    pub fn load<P: AsRef<Path>>(
-        path: P,
-        exec_config: Option<ExecutionConfig>,
-    ) -> Result<Self> {
+    pub fn load<P: AsRef<Path>>(path: P, exec_config: Option<ExecutionConfig>) -> Result<Self> {
         Self::from_pretrained(path, exec_config)
     }
 }
@@ -221,7 +220,12 @@ impl ParakeetUnified {
         exec_config: Option<ExecutionConfig>,
         streaming_config: UnifiedStreamingConfig,
     ) -> Result<Self> {
-        Self::from_pretrained_with_decoding(path, exec_config, streaming_config, DecodingStrategy::Greedy)
+        Self::from_pretrained_with_decoding(
+            path,
+            exec_config,
+            streaming_config,
+            DecodingStrategy::Greedy,
+        )
     }
 
     /// Load ParakeetUnified with a custom streaming profile and decoding strategy.
@@ -381,9 +385,10 @@ impl ParakeetUnified {
                 &self.feature_cache,
             )?;
             let (encoded, encoded_len) = {
-                let mut model = self.model.lock().map_err(|e| {
-                    Error::Model(format!("Failed to acquire model lock: {e}"))
-                })?;
+                let mut model = self
+                    .model
+                    .lock()
+                    .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
                 model.run_encoder(&features)?
             };
 
@@ -393,8 +398,12 @@ impl ParakeetUnified {
 
             let absolute_frame_offset =
                 self.next_chunk_start_sample / (HOP_LENGTH * SUBSAMPLING_FACTOR);
-            let tokens =
-                self.decode_encoder_frames(&encoded, start_frame, end_frame, absolute_frame_offset)?;
+            let tokens = self.decode_encoder_frames(
+                &encoded,
+                start_frame,
+                end_frame,
+                absolute_frame_offset,
+            )?;
             self.accumulated_tokens
                 .extend(tokens.iter().map(|(id, _)| *id));
             self.accumulated_timed_tokens
@@ -424,7 +433,9 @@ impl ParakeetUnified {
 
         let available_left = chunk_start_sample.saturating_sub(self.buffer_start_sample);
         let available_left = available_left.min(left_context_samples);
-        let available_main = total_received.saturating_sub(chunk_start_sample).min(chunk_samples);
+        let available_main = total_received
+            .saturating_sub(chunk_start_sample)
+            .min(chunk_samples);
         let available_right = if flush {
             total_received
                 .saturating_sub(chunk_start_sample + available_main)
@@ -487,9 +498,12 @@ impl ParakeetUnified {
         absolute_frame_offset: usize,
     ) -> Result<Vec<(usize, usize)>> {
         match self.decoding {
-            DecodingStrategy::Greedy => {
-                self.decode_encoder_frames_greedy(encoder_out, start_frame, end_frame, absolute_frame_offset)
-            }
+            DecodingStrategy::Greedy => self.decode_encoder_frames_greedy(
+                encoder_out,
+                start_frame,
+                end_frame,
+                absolute_frame_offset,
+            ),
             DecodingStrategy::Beam(beam_config) => self.decode_encoder_frames_beam(
                 encoder_out,
                 start_frame,
@@ -528,12 +542,8 @@ impl ParakeetUnified {
             let absolute_frame = absolute_frame_offset + (frame_idx - start_frame);
 
             for _ in 0..MAX_SYMBOLS_PER_STEP {
-                let (logits, new_state_1, new_state_2) = model.run_decoder(
-                    &frame,
-                    self.last_token,
-                    &self.state_1,
-                    &self.state_2,
-                )?;
+                let (logits, new_state_1, new_state_2) =
+                    model.run_decoder(&frame, self.last_token, &self.state_1, &self.state_2)?;
 
                 let token_id = logits
                     .iter()
@@ -579,12 +589,10 @@ impl ParakeetUnified {
             .lock()
             .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
 
-        let mut decoder = |frame: &Array3<f32>,
-                           last_token: i32,
-                           state_1: &Array3<f32>,
-                           state_2: &Array3<f32>| {
-            model.run_decoder(frame, last_token, state_1, state_2)
-        };
+        let mut decoder =
+            |frame: &Array3<f32>, last_token: i32, state_1: &Array3<f32>, state_2: &Array3<f32>| {
+                model.run_decoder(frame, last_token, state_1, state_2)
+            };
 
         let output = decode_rnnt_beam(
             encoder_out,

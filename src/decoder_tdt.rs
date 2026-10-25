@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_full_flow_with_timestamp_processing() {
-        use crate::timestamps::{process_timestamps, TimestampMode};
+        use crate::timestamps::{TimestampMode, process_timestamps};
 
         let vocab = make_vocab(&["▁like", "1", "0", "0", "▁bucks"]);
         let decoder = ParakeetTDTDecoder::from_vocab(vocab);

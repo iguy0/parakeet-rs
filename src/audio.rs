@@ -1,7 +1,7 @@
 use crate::config::{CtcFrontendConfig, NormalizationMode, PreprocessorConfig};
 use crate::error::{Error, Result};
 use hound::{WavReader, WavSpec};
-use ndarray::{s, Array2};
+use ndarray::{Array2, s};
 use realfft::RealToComplex;
 use std::f32::consts::PI;
 use std::path::Path;
@@ -437,10 +437,7 @@ pub fn extract_features_with_frontend(
     // NeMo / Parakeet-CTC uses first-order preemphasis. Granite-style
     // DbFloorScale frontends do not; skip so default PreprocessorConfig
     // preemphasis cannot leak into those models.
-    if matches!(
-        frontend.normalization,
-        NormalizationMode::PerFeatureZNorm
-    ) {
+    if matches!(frontend.normalization, NormalizationMode::PerFeatureZNorm) {
         apply_preemphasis_in_place(&mut audio, config.preemphasis);
     }
 
@@ -691,6 +688,54 @@ fn stack_with_win3_deltas(features: &Array2<f32>, stack_factor: usize) -> Array2
         }
     }
     out
+}
+
+/// Width of the energy frame used to pick a long-audio split point.
+const QUIET_FRAME_MS: usize = 100;
+/// How far back from the end of a window the quiet-point search looks.
+const QUIET_SEARCH_MS: usize = 5_000;
+
+/// Sample index at which to cut `audio` so the left piece is at most
+/// `window_samples` long.
+///
+/// When `audio` is within the window, returns `audio.len()`. Otherwise returns
+/// the start of the lowest-energy 100 ms frame inside the last 5 seconds of
+/// the window. A zero index is replaced with `window_samples` so a caller
+/// always makes progress.
+pub(crate) fn split_at_quiet_point(
+    audio: &[f32],
+    window_samples: usize,
+    sample_rate: u32,
+) -> usize {
+    if window_samples == 0 || audio.len() <= window_samples {
+        return audio.len();
+    }
+    let rate = sample_rate.max(1) as usize;
+    let frame = (rate.saturating_mul(QUIET_FRAME_MS) / 1000).max(1);
+    let search_back = rate.saturating_mul(QUIET_SEARCH_MS) / 1000;
+    let window_end = window_samples;
+    if frame >= window_end {
+        return window_end;
+    }
+    let last_start = window_end - frame;
+    let first_start = window_end.saturating_sub(search_back).min(last_start);
+    let mut energy = 0.0f64;
+    for &sample in &audio[first_start..first_start + frame] {
+        let value = sample as f64;
+        energy += value * value;
+    }
+    let mut best_energy = energy;
+    let mut best = first_start;
+    for start in (first_start + 1)..=last_start {
+        let leave = audio[start - 1] as f64;
+        let enter = audio[start + frame - 1] as f64;
+        energy += enter * enter - leave * leave;
+        if energy < best_energy {
+            best_energy = energy;
+            best = start;
+        }
+    }
+    if best == 0 { window_end } else { best }
 }
 
 #[cfg(test)]

@@ -97,7 +97,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!(
             "  Config: chunk_len={}, fifo_len={}, spkcache_len={}, right_context={}",
-            sortformer.chunk_len, sortformer.fifo_len, sortformer.spkcache_len, sortformer.right_context
+            sortformer.chunk_len,
+            sortformer.fifo_len,
+            sortformer.spkcache_len,
+            sortformer.right_context
         );
         println!("  Latency: {:.2}s", sortformer.latency());
 

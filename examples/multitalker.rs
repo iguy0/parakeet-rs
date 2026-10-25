@@ -140,5 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(not(feature = "multitalker"))]
 fn main() {
     eprintln!("This example requires the 'multitalker' feature.");
-    eprintln!("Run with: cargo run --example multitalker --features multitalker -- <audio.wav> <model_dir> <sortformer.onnx>");
+    eprintln!(
+        "Run with: cargo run --example multitalker --features multitalker -- <audio.wav> <model_dir> <sortformer.onnx>"
+    );
 }

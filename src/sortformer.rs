@@ -24,7 +24,7 @@
 
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig;
-use ndarray::{s, Array1, Array2, Array3, ArrayView2, Axis};
+use ndarray::{Array1, Array2, Array3, ArrayView2, Axis, s};
 use ort::session::Session;
 use realfft::RealFftPlanner;
 use std::f32::consts::PI;
@@ -326,7 +326,12 @@ impl StreamPost {
         if self.preds.nrows() > 0 {
             parts.push(self.preds.view());
         }
-        parts.extend(new_frames.iter().filter(|p| p.nrows() > 0).map(|p| p.view()));
+        parts.extend(
+            new_frames
+                .iter()
+                .filter(|p| p.nrows() > 0)
+                .map(|p| p.view()),
+        );
         if parts.is_empty() {
             return Vec::new();
         }
@@ -385,7 +390,8 @@ impl StreamPost {
             // Trim frames that can no longer matter. Keep enough left context for the median
             // filter and onset padding, and enough history for activity that has started but
             // has not yet reached `min_duration_on`.
-            let on_frames = ((config.min_duration_on * SAMPLE_RATE as f32) / spf as f32).ceil() as u64 + 2;
+            let on_frames =
+                ((config.min_duration_on * SAMPLE_RATE as f32) / spf as f32).ceil() as u64 + 2;
             let ctx = half + 1 + (pad_on as f32 / spf as f32).ceil() as u64;
             let safe = pending_start_frame
                 .unwrap_or(u64::MAX)
@@ -431,6 +437,8 @@ pub struct Sortformer {
     continuous_feed: bool,
     audio_buffer: Vec<f32>,
     elapsed_samples: usize,
+    /// Successful `streaming_update` ONNX runs since the last [`reset_state`](Self::reset_state).
+    session_runs: u64,
     // Mel filterbank (cached)
     mel_basis: Array2<f32>,
 }
@@ -538,6 +546,7 @@ impl Sortformer {
             mel_basis,
             stream_post: StreamPost::new(num_speakers),
             continuous_feed: true,
+            session_runs: 0,
         };
         instance.reset_state();
         Ok(instance)
@@ -552,6 +561,17 @@ impl Sortformer {
     /// Number of speaker output channels (from ONNX metadata, default 4).
     pub fn num_speakers(&self) -> usize {
         self.num_speakers
+    }
+
+    /// ONNX `session.run` calls inside streaming inference
+    /// since the last [`reset_state`](Self::reset_state).
+    ///
+    /// One increment per streaming window, including windows reached through
+    /// `diarize_chunk_raw`, `feed_raw`, and `flush_raw`. Intended for tests that
+    /// compare Sortformer stride; not part of the diarization result API.
+    #[doc(hidden)]
+    pub fn session_runs(&self) -> u64 {
+        self.session_runs
     }
 
     /// The session this instance owns.
@@ -581,6 +601,7 @@ impl Sortformer {
         self.stream_post.reset(self.num_speakers);
         self.audio_buffer.clear();
         self.elapsed_samples = 0;
+        self.session_runs = 0;
     }
 
     /// Main diarization entry point
@@ -938,7 +959,10 @@ impl Sortformer {
             all_chunk_preds.push(chunk_preds);
         }
 
-        Ok(Self::concat_predictions(&all_chunk_preds, self.num_speakers))
+        Ok(Self::concat_predictions(
+            &all_chunk_preds,
+            self.num_speakers,
+        ))
     }
 
     /// NeMo's streaming_update with smart cache compression
@@ -1031,6 +1055,7 @@ impl Sortformer {
 
             (preds, new_embs, valid_frames)
         };
+        self.session_runs = self.session_runs.saturating_add(1);
 
         if let (Some(router), Some(started)) = (self.router.as_mut(), inference_start) {
             router.call_finished(window, started.elapsed());
@@ -1152,7 +1177,10 @@ impl Sortformer {
         let sil_frames = self.spkcache_sil_frames_per_spk;
         if per_spk <= sil_frames {
             // truncate if cache too small for compression
-            self.spkcache = self.spkcache.slice(s![.., ..self.spkcache_len, ..]).to_owned();
+            self.spkcache = self
+                .spkcache
+                .slice(s![.., ..self.spkcache_len, ..])
+                .to_owned();
             if let Some(ref p) = self.spkcache_preds {
                 self.spkcache_preds = Some(p.slice(s![.., ..self.spkcache_len, ..]).to_owned());
             }
@@ -1306,8 +1334,7 @@ impl Sortformer {
         // Flatten scores as (S, T) then reshape to (S*T,)
         // This means we iterate: speaker 0 all times, then speaker 1 all times, etc.
         // flat_index = speaker * n_frames + time
-        let mut flat_scores: Vec<(usize, f32)> =
-            Vec::with_capacity(n_frames * self.num_speakers);
+        let mut flat_scores: Vec<(usize, f32)> = Vec::with_capacity(n_frames * self.num_speakers);
         for s in 0..self.num_speakers {
             for t in 0..n_frames {
                 let flat_idx = s * n_frames + t;
@@ -1485,8 +1512,8 @@ impl Sortformer {
                 } else if p < config.offset && in_seg {
                     in_seg = false;
 
-                    let start_s = (seg_start as u64 * samples_per_frame)
-                        .saturating_sub(pad_onset_samples);
+                    let start_s =
+                        (seg_start as u64 * samples_per_frame).saturating_sub(pad_onset_samples);
                     let end_s = t as u64 * samples_per_frame + pad_offset_samples;
 
                     if end_s - start_s >= min_dur_on_samples {
@@ -1501,8 +1528,8 @@ impl Sortformer {
 
             // Handle segment at end
             if in_seg {
-                let start_s = (seg_start as u64 * samples_per_frame)
-                    .saturating_sub(pad_onset_samples);
+                let start_s =
+                    (seg_start as u64 * samples_per_frame).saturating_sub(pad_onset_samples);
                 let end_s = num_frames as u64 * samples_per_frame + pad_offset_samples;
 
                 if end_s - start_s >= min_dur_on_samples {
@@ -1676,9 +1703,18 @@ mod tests {
     fn synthetic_preds(frames: usize, num_speakers: usize) -> Array2<f32> {
         let mut p = Array2::from_elem((frames, num_speakers), 0.02f32);
         let bursts: &[(usize, usize, usize)] = &[
-            (5, 40, 0), (44, 90, 0), (60, 130, 1), (120, 124, 2), (150, 151, 1),
-            (200, 330, 2), (210, 215, 0), (240, 260, 0), (262, 300, 0), (400, 590, 1),
-            (410, 430, 2), (560, 600, 0),
+            (5, 40, 0),
+            (44, 90, 0),
+            (60, 130, 1),
+            (120, 124, 2),
+            (150, 151, 1),
+            (200, 330, 2),
+            (210, 215, 0),
+            (240, 260, 0),
+            (262, 300, 0),
+            (400, 590, 1),
+            (410, 430, 2),
+            (560, 600, 0),
         ];
         for &(a, b, spk) in bursts {
             for t in a..b.min(frames) {
@@ -1701,9 +1737,15 @@ mod tests {
         let frames = 610;
         let preds = synthetic_preds(frames, 3);
         let total = frames as u64 * 1280 - 500; // audio ends mid-frame
-        for config in [DiarizationConfig::callhome(), DiarizationConfig::nemotron3()] {
+        for config in [
+            DiarizationConfig::callhome(),
+            DiarizationConfig::nemotron3(),
+        ] {
             let offline = Sortformer::post_process(&config, &preds, total);
-            assert!(offline.len() >= 6, "synthetic stream should yield several segments");
+            assert!(
+                offline.len() >= 6,
+                "synthetic stream should yield several segments"
+            );
             for step in [1usize, 3, 9, 340] {
                 let mut sp = StreamPost::new(3);
                 let mut got = Vec::new();
@@ -1714,7 +1756,12 @@ mod tests {
                     t = e;
                 }
                 got.extend(sp.process(&config, &[], Some(total)));
-                assert_eq!(key(&got), key(&offline), "step={step} median={}", config.median_window);
+                assert_eq!(
+                    key(&got),
+                    key(&offline),
+                    "step={step} median={}",
+                    config.median_window
+                );
             }
         }
     }
