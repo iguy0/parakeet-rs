@@ -67,8 +67,8 @@ git push-fork        # push current branch to origin (iguy0)
 | `plans/BEAM_SEARCH_IMPLEMENTATION_PLAN.md` | Added | Design notes for the beam search work |
 | `scripts/export_nemotron_streaming.py` | Modified | Export/latency documentation and `--right-context` presets |
 | `src/nemotron.rs` | Modified | 560 ms chunk config comment + beam decoding hook; `flush` / `flush_with_tokens` finish the streaming tail (offline last-chunk pad); `#[doc(hidden)] stage_timing_ns` |
-| `scripts/quantize_nemotron_streaming.py` | Untracked | Local INT8/INT4 quantization tooling (candidate for upstream) |
-| `scripts/export_ultra_diar_8spk.py` | Untracked | 8-speaker Sortformer export |
+| `scripts/quantize_nemotron_streaming.py` | Added | INT8/INT4 quantization tooling (candidate for upstream) |
+| `scripts/export_ultra_diar_8spk.py` | Added | 8-speaker Sortformer export |
 | `scripts/export_nemotron3_diarization.py` | Added | `nvidia/Nemotron-3-Diarization` export (31-layer RoPE transformer, 8 spk, 99.2M params). Same 6-in/3-out ONNX contract as the other Sortformer exports; presets `offline`/`low`/`verylow`/`ultralow`; swaps NeMo FlexAttention for dense-mask SDPA at export time; stamps cache-compression metadata; optional `--int8-output` + `--compare-wav` |
 | `src/sortformer.rs` (metadata) | Modified | `num_speakers` (default 4), plus optional `spkcache_sil_frames_per_spk` (default 3), `scores_boost_latest` (default 0), `sil_emb` (fixed silence embedding replacing the running mean). Absent keys keep legacy behaviour |
 | `src/sortformer.rs` (API) | Modified | `SessionRouter` + `set_session_router`; `diarize()` = `predict_raw()` + `post_process()`; `feed_raw`/`flush_raw` (raw 80 ms probabilities); `feed`/`flush` post-process continuously across windows via private `StreamPost` (`set_continuous_feed(false)` = legacy per-window); `DiarizationConfig::nemotron3()` preset. `session_runs` (`doc(hidden)`) counts streaming ONNX runs since `reset_state` |
@@ -77,14 +77,15 @@ git push-fork        # push current branch to origin (iguy0)
 | `src/config.rs` | Modified | `CtcConfig`/`CtcFrontendConfig`/`NormalizationMode` — metadata-driven CTC blank-id/token-offset/frontend (deltas, frame stacking, db-floor normalization, encoder subsample), read from ONNX `metadata_props` with Parakeet-CTC-0.6b defaults when absent. `logit_frame_ratio_disagrees` checks `encoder_subsample * stack_factor` against the first forward |
 | `scripts/patch_ctc_onnx_metadata.py` | Added | Stamps `ctc_*` metadata keys onto third-party CTC ONNX graphs (e.g. Granite TurboCTC) so `CtcConfig::from_metadata` picks them up |
 | `src/model.rs` | Modified | Reads `CtcConfig` from session metadata at load time via `ctc_config_from_session`. `with_logits` borrows the logit buffer; `forward` still returns an owned array. One stderr warning if the first forward's frame ratio disagrees with metadata |
-| `src/execution.rs` | Modified | `ModelConfig::build_session()` public; `ModelConfig` is `Send + Sync` (`configure` hook now `Arc<dyn Fn(...) + Send + Sync>`); `coreml_cache_dir` (skip CoreML recompilation); `webgpu_device_id` *(feature `webgpu`)*; forces sequential execution + disabled memory pattern for WebGPU/DirectML |
+| `src/execution.rs` | Modified | Private `default_environment()` (process-wide `ort` Environment, required since rc.14; an embedder-created `ort::init().build()` first causes "only one environment" error); `ModelConfig::build_session()` public; `ModelConfig` is `Send + Sync` (`configure` hook now `Arc<dyn Fn(...) + Send + Sync>`); `coreml_cache_dir` (skip CoreML recompilation); `webgpu_device_id` *(feature `webgpu`)*; forces sequential execution + disabled memory pattern for WebGPU/DirectML |
 | `src/model_tdt.rs` | Modified | `ParakeetTDTModel::from_pretrained_with_configs` — separate `ExecutionConfig` for the encoder vs. the decoder/joint session |
 | `src/ark_asr.rs`, `src/model_ark.rs` | Added | `ArkAsr` speech-LLM transcriber *(feature `ark-asr`)* — Whisper-style audio encoder + adapter + Qwen2 causal LM with static KV cache, for `Audio8/ark-asr-0.6b-int8-onnx`. `ArkLongAudioPolicy` (default `Truncate`) + `transcribe_long`; audio-token count taken from the encoder output; optional `set_repeat_guard` (default off) |
 | `src/cohere.rs`, `src/model_cohere.rs`, `src/audio.rs` | Modified | `transcribe_audio_long` + `set_max_chunk_secs` (default 35 s, quiet-point split shared with Ark via `audio::split_at_quiet_point`). Decoder reuses encoder K/V after the first step; layer/head/head-dim come from the decoder graph. Optional steady decoder: `set_use_steady_decoder` (default on when `decoder_model_steady.onnx` or `decoder_model_steady_quantized.onnx` sits next to the merged decoder, flat or under `onnx/`); absent file keeps the merged graph for every step |
 | `scripts/export_cohere_steady_decoder.py` | Added | Derives a steady-state Cohere decoder from the Optimum merged graph (no first-step `If`, no `encoder_hidden_states`, no `present.*.encoder.*`). Stamps `cohere_decoder_variant=steady`. External weights stay at their original offsets; the data file is hardlinked beside the output, or copied if the filesystem rejects the link |
 | `tests/auto_traits.rs` | Added | Compile-time `Send`/`Sync` assertion for `Sortformer` (gated on feature `sortformer`) |
 | `plans/WEBGPU_IMPLEMENTATION_PLAN.md` | Added | WebGPU EP validation plan/progress (Linux Vulkan dev, Windows D3D12 path, Nemotron-only correctness policy) |
-| `AGENTS.md` | Untracked | This file |
+| `plans/ASR_PERFORMANCE_IMPLEMENTATION_PLAN.md` | Added | Phased ASR throughput/correctness plan (Ark, Cohere, Nemotron flush, Granite, Multitalker, Cohere steady decoder) with baselines and thread sweep |
+| `AGENTS.md` | Added | This file |
 
 ---
 
@@ -95,7 +96,7 @@ git push-fork        # push current branch to origin (iguy0)
 | Layer | Technology |
 |-------|------------|
 | Language | Rust 2024 (`parakeet-rs` v0.3.7) |
-| Inference | [ort](https://docs.rs/ort) 2.0.0-rc.13 (ONNX Runtime bindings) |
+| Inference | [ort](https://docs.rs/ort) 2.0.0-rc.15 (ONNX Runtime bindings; needs a process-wide `Environment`, see `execution.rs`) |
 | Arrays | `ndarray` 0.17 |
 | Tokenizers | `tokenizers` 0.23 (CTC/EOU/Cohere), custom SentencePiece (Nemotron/TDT/Unified) |
 | Audio I/O | `hound` (WAV), `realfft` (STFT/mel) |
@@ -200,7 +201,7 @@ Post-processing: `DiarizationConfig` presets (`callhome()`, `dihard3()`, `ultra_
 |--------|---------|------------------|
 | `scripts/export_nemotron_streaming.py` | Nemotron EN ONNX export; `--right-context` sets latency | `nemotron.rs` `CHUNK_SIZE`, `PRE_ENCODE_CACHE` |
 | `scripts/export_nemotron_streaming_multilingual.py` | Multilingual 3.5 export | Same `Nemotron` API, auto-detects mode |
-| `scripts/quantize_nemotron_streaming.py` | Local INT8/INT4 quantization *(fork-only, untracked)* | Load quantized ONNX like any other model dir |
+| `scripts/quantize_nemotron_streaming.py` | Local INT8/INT4 quantization *(fork-only)* | Load quantized ONNX like any other model dir |
 | `scripts/export_realtime_eou_120m.py` | EOU model export | `parakeet_eou.rs` constants |
 | `scripts/export_parakeet_unified.py` | Unified RNNT export | `parakeet_unified.rs` |
 | `scripts/export_multitalker.py` | Multitalker encoder/decoder export | `multitalker.rs` |
@@ -339,7 +340,7 @@ flowchart LR
 | Medium | Beam search (CTC/TDT/RNNT) | **Done locally** — `src/decoding/`; remaining: optional LM rescoring, honor `patience`/`length_penalty` uniformly across families |
 | Medium | Model-backed WER/DER benchmark suite | **Done locally** — `tests/model_benchmark.rs` (real-weight, weight-gated). Remaining: tiny fixture ONNX graphs for weight-free CI |
 | Medium | Load CTC configs from metadata instead of hardcoding | **Done locally** — `config.rs` `CtcConfig::from_metadata` + `scripts/patch_ctc_onnx_metadata.py`. Remaining: same treatment for TDT (`model_tdt.rs` still assumes fixed vocab/shape); `ModelConfigJson`/`PreprocessorConfig` still not read from `config.json` at runtime |
-| Medium | WebGPU EP validation (Linux dev → Windows 11 D3D12 certification) | **In progress** — `plans/WEBGPU_IMPLEMENTATION_PLAN.md`; Nemotron still blocked on `ort` rc.12/rc.13 Vulkan Slice validation |
+| Medium | WebGPU EP validation (Linux dev → Windows 11 D3D12 certification) | **In progress** — `plans/WEBGPU_IMPLEMENTATION_PLAN.md`; Nemotron WebGPU parity now passes on `ort` rc.15 (Linux/Vulkan); remaining: Windows D3D12 validation |
 | High | Nemotron-3-Diarization support (export, INT8, metadata-driven cache compression, streaming) | **Done locally** — `scripts/export_nemotron3_diarization.py`, `sortformer.rs`. Remaining: upstream as small PRs (export script; optional metadata keys; `StreamPost`, noting that `feed()` output now arrives after finalization), and run the low-latency presets on the 11-speaker clip |
 | Medium | Benchmark Nemotron-3 fp32 on CUDA (INT8 falls back to CPU, so low-latency presets are about real-time or slower on CPU) | `tests/model_benchmark.rs` with `PARAKEET_EP=cuda` + cuDNN on `LD_LIBRARY_PATH` |
 | Medium | Make `DiarizationConfig::for_num_speakers` / presets model-aware (e.g. stamp a preferred preset name into ONNX metadata) so `Sortformer::new` is tuned per export without caller knowledge | `sortformer.rs`, export scripts |
@@ -379,7 +380,7 @@ parakeet-rs/
 ├── tests/                  # model_benchmark.rs (weight-gated WER/DER) + common/mod.rs + auto_traits.rs
 ├── scripts/                # NeMo → ONNX export (+ local quantize, CTC metadata patch, Nemotron-3 diarization export)
 │   └── benchmark/          # run_all.sh, manifest.toml, compare_greedy_beam.py
-├── plans/                  # Design docs (BEAM_SEARCH_IMPLEMENTATION_PLAN.md, WEBGPU_IMPLEMENTATION_PLAN.md)
+├── plans/                  # Design docs (BEAM_SEARCH_, WEBGPU_, ASR_PERFORMANCE_IMPLEMENTATION_PLAN.md)
 └── .github/workflows/rust.yml
 ```
 

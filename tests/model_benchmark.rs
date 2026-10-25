@@ -2318,7 +2318,7 @@ fn assert_cpu_webgpu_wer_parity(
                 test,
                 &format!(
                     "WebGPU transcribe failed ({e}); see plans/WEBGPU_IMPLEMENTATION_PLAN.md \
-section 4 (known ORT WebGPU issues on some graphs, e.g. Nemotron Slice on ort rc.12 Linux/Vulkan)"
+section 4 (known ORT WebGPU issues on some graphs, e.g. Nemotron Slice on ort rc.12 Linux/Vulkan, fixed in rc.15)"
                 ),
             );
         }
@@ -2326,7 +2326,7 @@ section 4 (known ORT WebGPU issues on some graphs, e.g. Nemotron Slice on ort rc
 }
 
 /// CPU vs WebGPU WER parity on the smoke clip. CTC offline is the primary P0
-/// target; Nemotron streaming is optional (may segfault on ort rc.12 — opt in
+/// target; Nemotron streaming is optional (segfaulted on ort rc.12, passes on rc.15 — opt in
 /// with `PARAKEET_WEBGPU_NEMOTRON_PARITY=1`).
 #[cfg(feature = "webgpu")]
 #[test]
@@ -2375,7 +2375,7 @@ fn webgpu_cpu_wer_parity_smoke() {
     if !nemotron_parity {
         skip(
             "webgpu_cpu_wer_parity_smoke/nemotron",
-            "set PARAKEET_WEBGPU_NEMOTRON_PARITY=1 to run (may segfault on ort rc.12 Linux/Vulkan)",
+            "set PARAKEET_WEBGPU_NEMOTRON_PARITY=1 to run (segfaulted on ort rc.12; passes on rc.15 Linux/Vulkan)",
         );
         return;
     }

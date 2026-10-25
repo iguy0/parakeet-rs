@@ -11,11 +11,11 @@
 | **Phase 4** — CPU vs WebGPU correctness matrix | **Partial** | CSV `ep` column done; `webgpu_cpu_wer_parity_smoke` still uses CTC P0 — **refactor to Nemotron-only** (see §3.0, §5 Phase 4) |
 | **Phase 5** — CI compile gate | **Done** | Ubuntu `webgpu-build` + `cargo test --lib`; optional `webgpu-build-windows` compile job in `rust.yml` |
 | **Phase 6** — Windows 11 validation | **Not started** | Manual or self-hosted runner; D3D12 path |
-| **Phase 7** — Upstream ORT tracking | **Ongoing** | Nemotron fails on ort `2.0.0-rc.12`; monitor rc.13+ for WebGPU fixes |
+| **Phase 7** — Upstream ORT tracking | **Ongoing** | Nemotron failed on ort `2.0.0-rc.12`; **fixed on `2.0.0-rc.15`** (Linux/Vulkan parity verified 2026-10-25); keep tracking stable 2.0 |
 
-**Last updated:** 2026-06-26 (Phase 5 done; WebGPU test model policy → Nemotron)  
+**Last updated:** 2026-10-25 (ort bumped to rc.15; Nemotron WebGPU parity passes on Linux/Vulkan)  
 **Current phase:** Phase 4 follow-up — refactor WebGPU tests to Nemotron-only; then Phase 6 (Windows 11 D3D12 validation)  
-**Status:** CI compiles `--features webgpu` on Ubuntu + Windows; parity harness exists but targets CTC — **all WebGPU tests must use `nemotron-speech-streaming-en-0.6b`** (int8 ONNX at `models/nemotron-speech-streaming-en-0.6b_int8_onnx/`); Nemotron WebGPU still blocked on ort rc.12 (Linux/Vulkan Slice validation)  
+**Status:** CI compiles `--features webgpu` on Ubuntu + Windows; parity harness exists but targets CTC — **all WebGPU tests must use `nemotron-speech-streaming-en-0.6b`** (int8 ONNX at `models/nemotron-speech-streaming-en-0.6b_int8_onnx/`); Nemotron WebGPU no longer blocked: passes on ort rc.15 (was a Linux/Vulkan Slice validation failure on rc.12)  
 **Primary objective:** Develop and validate WebGPU on Linux, with a path to certify behavior for Windows 11 users, without changing CPU defaults or breaking upstream mergeability.
 
 ### WebGPU test model policy
@@ -32,7 +32,7 @@
 
 Do **not** use Parakeet CTC, TDT, or other families for WebGPU parity unless explicitly expanding the matrix after Nemotron passes. Examples (`streaming.rs`), benchmark harness (`run_all.sh`), and `webgpu_cpu_wer_parity_smoke` should all target Nemotron when `PARAKEET_EP=webgpu` or `--ep webgpu`.
 
-**Known blocker (Linux/Vulkan, ort rc.12):** WebGPU inference on Nemotron may fail on first `transcribe_chunk` (Slice validation) or segfault. Tests must skip gracefully on EP failure until ort fixes land; do not mask failures by falling back to a different model.
+**Resolved on ort rc.15 (Linux/Vulkan):** on rc.12, WebGPU inference on Nemotron failed on first `transcribe_chunk` (Slice validation) and segfaulted. With rc.15, `PARAKEET_WEBGPU_NEMOTRON_PARITY=1 cargo test --release --features webgpu --test model_benchmark webgpu` gives CPU WER 1.9% vs WebGPU WER 1.9% (delta 0.0%) on the smoke clip, RTF 2.6x (CPU) vs 0.3x (WebGPU). Tests still skip gracefully on EP failure; do not mask failures by falling back to a different model.
 
 ---
 
@@ -132,7 +132,7 @@ WebGPU affects **only ONNX session creation**. Audio prep, decoders, streaming c
 - Consumers choose at compile time: `features = ["webgpu"]` OR `features = ["cuda"]`.
 - Windows NVIDIA users may prefer `cuda`; cross-vendor Windows users: `webgpu` or `directml`.
 
-Dependency pin: `ort = "2.0.0-rc.12"` → ORT ~1.24. Recent upstream fixes (e.g. [buffer segment alignment PR #27853](https://github.com/microsoft/onnxruntime/pull/27853), [Slice int32 PR #26693](https://github.com/microsoft/onnxruntime/pull/26693)) may require bumping ort when released.
+Dependency pin: `ort = "2.0.0-rc.15"` (was rc.12 when this plan was written; ORT ~1.24 then). Recent upstream fixes (e.g. [buffer segment alignment PR #27853](https://github.com/microsoft/onnxruntime/pull/27853), [Slice int32 PR #26693](https://github.com/microsoft/onnxruntime/pull/26693)) may require bumping ort when released.
 
 ### 2.6 Runtime dylibs
 
@@ -281,7 +281,7 @@ Vulkan stack is healthy; failure is at ORT WebGPU / graph level.
 | Missing Vulkan drivers | **Ruled out** | `vulkaninfo` sees RTX 3090; `nvidia_icd.json` present |
 | parakeet-rs EP wiring bug | **Unlikely** | Same code path works for CPU; ort `WebGPU::default()` is standard |
 | Nemotron ONNX graph incompatibility with WebGPU EP | **Primary** | Error on `Slice` node during encoder forward |
-| ort version too old for WebGPU fixes | **Contributing** | rc.12 predates Mar 2026 buffer-alignment fix in ORT main |
+| ort version too old for WebGPU fixes | **Mitigated** | Bumped to rc.15, which includes the fixes needed for Nemotron on Linux/Vulkan |
 | Multi-GPU device selection | **Unknown** | Not tested; ort supports `with_device_id` — worth Phase 2 |
 | Linux-only Vulkan issue | **Possible but unproven** | Windows D3D12 may differ; must test separately |
 
@@ -386,7 +386,7 @@ builder = builder
 
 Apply **before** `with_execution_providers`. Do not apply for CPU/CUDA/CoreML (transcribe-rs excludes WebGPU from `Auto` mode for this reason).
 
-**Verified locally (2026-06-26):** Adding these flags does **not** fix Nemotron Slice validation on ort rc.12 — still required for spec compliance and Windows DirectML.
+**Verified locally (2026-06-26):** Adding these flags did **not** fix Nemotron Slice validation on ort rc.12 (rc.15 fixed it independently) — still required for spec compliance and Windows DirectML.
 
 **File:** `src/execution.rs`
 
@@ -497,7 +497,7 @@ Add test `webgpu_cpu_wer_parity_smoke` (**Nemotron streaming only**):
 2. Transcribe smoke clip with CPU → `wer_cpu` (`Nemotron::from_pretrained`, streaming chunks)
 3. Transcribe smoke clip with WebGPU → `wer_gpu` (or capture error)
 4. If WebGPU succeeds: assert `|wer_gpu - wer_cpu| <= PARAKEET_WEBGPU_MAX_WER_DELTA` (default e.g. 0.05)
-5. If WebGPU fails: print skip + link to this plan §4 (known upstream issue on ort rc.12 Linux/Vulkan)
+5. If WebGPU fails: print skip + link to this plan §4 (known upstream issue on ort rc.12 Linux/Vulkan; fixed in rc.15)
 
 **Remove** CTC branch and `PARAKEET_WEBGPU_NEMOTRON_PARITY` opt-in once refactored.
 
@@ -505,7 +505,7 @@ Run matrix (document in plan; **WebGPU P0 = Nemotron only**):
 
 | Model | Mode | WebGPU priority |
 |-------|------|-----------------|
-| **Nemotron EN 0.6B** | streaming | **P0** (canonical; currently fails Linux/Vulkan rc.12) |
+| **Nemotron EN 0.6B** | streaming | **P0** (canonical; passes Linux/Vulkan on rc.15, failed on rc.12) |
 | CTC | offline | P2 (CPU benchmark only unless matrix expanded) |
 | Unified | offline + streaming | P2 |
 | TDT | offline | P2 |
@@ -582,7 +582,7 @@ Acceptance for Windows 11 users (once ORT stable):
 
 **Actions:**
 
-1. **Bump ort** when `2.0.0-rc.13+` (or stable 2.0) ships with WebGPU fixes — re-run Phase 4 matrix.
+1. **Bump ort** — done for rc.15 (2026-10-25, Nemotron parity passes). Re-run the Phase 4 matrix on stable 2.0.
 2. **File upstream issue** if Nemotron encoder still fails after bump:
    - Attach: ORT version, GPU/driver, `vulkaninfo --summary`, minimal repro (encoder-only ORT Run on `encoder.onnx` with WebGPU EP).
    - Reference: [ORT #26690](https://github.com/microsoft/onnxruntime/issues/26690) (Slice), [PR #27853](https://github.com/microsoft/onnxruntime/pull/27853) (buffer alignment).
@@ -613,7 +613,7 @@ Update AGENTS.md "Current local delta" table with WebGPU harness row when Phase 
 WebGPU remains **opt-in experimental** until all of:
 
 - [ ] Phase 1–3 complete (harness + CLI)
-- [ ] Phase 4: Nemotron smoke passes WER parity CPU vs WebGPU on Linux **or** documented upstream blocker with skip logic (current: blocked on ort rc.12)
+- [ ] Phase 4: Nemotron smoke passes WER parity CPU vs WebGPU on Linux **or** documented upstream blocker with skip logic (rc.15: Nemotron smoke passes on Linux/Vulkan; blocker was ort rc.12)
 - [ ] Phase 4 follow-up: refactor `webgpu_cpu_wer_parity_smoke` to Nemotron-only (remove CTC / `PARAKEET_WEBGPU_NEMOTRON_PARITY`)
 - [ ] Phase 6: Windows 11 smoke passes (transcript + WER threshold)
 - [ ] Phase 5: CI compile gate green
@@ -668,7 +668,7 @@ vulkaninfo --summary
 
 **Exploration date:** 2026-06-26  
 **Machine:** Linux 6.8.0, 2× NVIDIA RTX 3090, driver 595.58.03  
-**ort version:** 2.0.0-rc.12  
+**ort version:** 2.0.0-rc.15 (rc.12 at the time of the original blocker analysis below)  
 **parakeet-rs version:** 0.3.6  
 **Model tested:** `models/nemotron-speech-streaming-en-0.6b_int8_onnx`  
 **Primary blocker:** ORT WebGPU EP validation failure on Slice node during Nemotron encoder inference (Linux/Vulkan); segfault on error path  
@@ -727,7 +727,7 @@ All model loaders already accept `Option<ExecutionConfig>` — no per-model EP p
 | WebGPU in Auto/fallback | N/A (explicit EP only) | Correct — WebGPU must stay opt-in |
 | Windows dylibs | Relies on ort `copy-dylibs` | Same — dxil/dxcompiler copied on Windows builds |
 
-**Local retest:** Applying `parallel_execution(false)` + `memory_pattern(false)` via `with_custom_configure` did **not** resolve Nemotron Slice validation on ort rc.12/Linux — flags are still required for correctness on Windows DirectML and spec compliance.
+**Local retest:** Applying `parallel_execution(false)` + `memory_pattern(false)` via `with_custom_configure` did **not** resolve Nemotron Slice validation on ort rc.12/Linux (rc.15 fixes it) — flags are still required for correctness on Windows DirectML and spec compliance.
 
 ### 10.3 Windows 11 viability (from official sources)
 
