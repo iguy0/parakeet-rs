@@ -8,7 +8,7 @@
 | **Phase 1** — EP harness (`PARAKEET_EP`) | **Done** | `execution_config()`, `ep_skip_if_unavailable()`, `PARAKEET_WEBGPU_DEVICE_ID` in `tests/common/mod.rs`; wired into `model_benchmark.rs` |
 | **Phase 2** — WebGPU session + config | **Done** | `parallel_execution(false)` + `memory_pattern(false)` for WebGPU/DirectML before EP registration; `with_webgpu_device_id()` on `ExecutionConfig` |
 | **Phase 3** — Example / benchmark CLI | **Done** | `--ep webgpu` on `streaming.rs` + `raw.rs`; `CARGO_FEATURES` + `PARAKEET_EP` in `run_all.sh` |
-| **Phase 4** — CPU vs WebGPU correctness matrix | **Partial** | CSV `ep` column done; `webgpu_cpu_wer_parity_smoke` still uses CTC P0 — **refactor to Nemotron-only** (see §3.0, §5 Phase 4) |
+| **Phase 4** — CPU vs WebGPU correctness matrix | **Done for 6 models** | CSV `ep` column done; Nemotron parity passes on rc.15; `webgpu_phase_matrix` covers Sortformer, Granite, Cohere, Multitalker, Nemotron and Ark on smoke + committee (see "Expanded WebGPU matrix"). `webgpu_cpu_wer_parity_smoke` still has the CTC-first layout |
 | **Phase 5** — CI compile gate | **Done** | Ubuntu `webgpu-build` + `cargo test --lib`; optional `webgpu-build-windows` compile job in `rust.yml` |
 | **Phase 6** — Windows 11 validation | **Not started** | Manual or self-hosted runner; D3D12 path |
 | **Phase 7** — Upstream ORT tracking | **Ongoing** | Nemotron failed on ort `2.0.0-rc.12`; **fixed on `2.0.0-rc.15`** (Linux/Vulkan parity verified 2026-10-25); keep tracking stable 2.0 |
@@ -30,10 +30,42 @@
 | API | `parakeet_rs::Nemotron` — streaming, 560 ms chunks |
 | Smoke clip | `samples/smoke/test01_20s.wav` |
 
-Do **not** use Parakeet CTC, TDT, or other families for WebGPU parity unless explicitly expanding the matrix after Nemotron passes. Examples (`streaming.rs`), benchmark harness (`run_all.sh`), and `webgpu_cpu_wer_parity_smoke` should all target Nemotron when `PARAKEET_EP=webgpu` or `--ep webgpu`.
+Nemotron passes on ort rc.15, so the matrix has been expanded (see "Expanded WebGPU matrix" below). Parakeet CTC, TDT, Unified and EOU remain untested (weights not present locally). Examples (`streaming.rs`), benchmark harness (`run_all.sh`), and `webgpu_cpu_wer_parity_smoke` should all target Nemotron when `PARAKEET_EP=webgpu` or `--ep webgpu`.
 
 **Resolved on ort rc.15 (Linux/Vulkan):** on rc.12, WebGPU inference on Nemotron failed on first `transcribe_chunk` (Slice validation) and segfaulted. With rc.15, `PARAKEET_WEBGPU_NEMOTRON_PARITY=1 cargo test --release --features webgpu --test model_benchmark webgpu` gives CPU WER 1.9% vs WebGPU WER 1.9% (delta 0.0%) on the smoke clip, RTF 2.6x (CPU) vs 0.3x (WebGPU). Tests still skip gracefully on EP failure; do not mask failures by falling back to a different model.
 
+
+### Expanded WebGPU matrix (ort rc.15, Linux/Vulkan, 2026-10-25)
+
+Measured with `webgpu_phase_matrix` (`tests/model_benchmark.rs`, `--ignored`, one model per process, results in `samples/webgpu_matrix.csv`, label `matrix1`). CPU is 4 intra-op threads. `smoke` is 24 s, `committee` is 632 s. RTFx = audio seconds / processing seconds (higher is faster). Accuracy was identical between CPU and WebGPU on the smoke clip for every model. On committee it was identical for Sortformer, Cohere, Multitalker and Ark; Granite (10.0% vs 9.6% WER) and Nemotron (11.1% vs 10.9%) differ by at most 0.4 points, consistent with floating-point differences accumulating over a long clip.
+
+| Model | Load CPU / WebGPU (s) | Smoke cold CPU / WebGPU (RTFx) | Smoke warm CPU / WebGPU (RTFx) | Committee CPU / WebGPU (RTFx) | Committee quality (both EPs) |
+|-------|------------------------|--------------------------------|--------------------------------|-------------------------------|------------------------------|
+| Sortformer 4spk v2.1 | 4.6 / 6.9 | 14.3 / 39.6 | 12.5 / 83.3 | 9.3 / 97.6 | DER 21.3% |
+| Granite TurboCTC | 3.2 / 4.9 | 18.8 / 5.4 | 19.1 / 5.5 | 18.6 / 7.1 | WER 10.0% (CPU), 9.6% (WebGPU) |
+| Cohere Transcribe | 1.4 / 16.7 | 0.7 / 1.8 | 0.8 / 1.8 | 0.7 / 1.3 | WER 6.3% |
+| Multitalker | 9.5 / 14.8 | 1.1 / 0.6 | 1.1 / 0.6 | 1.0 / 0.6 | WER 78.9% (joined speaker streams, not a WebGPU effect) |
+| Nemotron EN (int8) | 5.4 / 7.8 | 2.5 / 0.3 | 2.5 / 0.3 | 2.5 / 0.3 | WER 11.1% (CPU), 10.9% (WebGPU) |
+| Ark ASR (int8) | 8.9 / 12.0 | 1.4 / 0.3 | 1.3 / 0.3 | 1.2 / 0.2 | WER 5.7% |
+
+Findings:
+
+- **WebGPU wins:** Sortformer (about 10x on the long clip) and Cohere (about 1.9x). Both are encoder-heavy graphs with few host round trips.
+- **WebGPU loses:** Granite (about 2.6x slower), Multitalker (about 1.7x), Ark (about 6x), Nemotron (about 8x). Nemotron and Ark issue many small ONNX runs per clip (560 ms chunks; autoregressive LLM steps), so per-run launch and transfer overhead dominates.
+- **Pre steps:** WAV load is 0.01 s (24 s clip) to 0.22 s (632 s clip) and is negligible. Session load is 1.4 to 9.5 s on CPU and 4.9 to 16.7 s on WebGPU (Cohere is the outlier at 16.7 s versus 1.4 s). Cold and warm runs match within a few percent for every model except Sortformer, whose first run is about 2x slower (0.61 s versus 0.29 s), so WebGPU warm-up is small; the cost is in steady-state execution, not shader compilation.
+- **Nemotron stage split (committee, seconds):** CPU mel 0.8, encoder 242.0, decoder 5.7. WebGPU mel 0.7, encoder 1671.0, decoder 372.4. The encoder dominates on both; the decoder/joint step is about 65x slower on WebGPU, which is a CPU-friendly LSTM path. Running the encoder on WebGPU and the decoder/joint on CPU (as `ParakeetTDTModel::from_pretrained_with_configs` already allows for TDT; Nemotron has no equivalent yet) is the obvious next experiment, but the encoder alone is still about 7x slower on WebGPU, so it would not make Nemotron faster than CPU.
+- **Not measurable from the tests:** the mel/log-mel frontend of the other models is internal to the library, so it is included in `infer_s`. Only Nemotron exposes a mel/encoder/decoder split.
+- **Recommendation:** use WebGPU for Sortformer and Cohere; keep CPU for Nemotron, Ark, Granite and Multitalker on this hardware.
+
+Reproduce one cell:
+
+```
+PARAKEET_EP=webgpu PARAKEET_MATRIX_MODELS=granite cargo test --release \
+  --features "sortformer multitalker cohere ark-asr webgpu" --test model_benchmark \
+  webgpu_phase_matrix -- --ignored --nocapture
+```
+
+`PARAKEET_MATRIX_MODELS` takes a comma list of `granite,cohere,ark,nemotron,multitalker,sortformer`; `PARAKEET_MATRIX_SAMPLES` lists extra clips (default `committee`).
 ---
 
 ## 1. Problem Summary

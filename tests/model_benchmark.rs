@@ -2415,3 +2415,254 @@ fn webgpu_cpu_wer_parity_smoke() {
         "requires `cargo test --features webgpu`",
     );
 }
+
+// --- WebGPU phase matrix --------------------------------------------------
+
+/// One loaded model: runs a clip and returns `(transcript, optional (mel, encoder, decoder) seconds)`.
+#[cfg(feature = "webgpu")]
+type MatrixRun = Box<dyn FnMut(&[f32]) -> (String, Option<(f64, f64, f64)>)>;
+
+#[cfg(feature = "webgpu")]
+const WEBGPU_MATRIX_HEADER: &str = "run_id,label,model,ep,sample,audio_secs,audio_load_s,\
+model_load_s,run,infer_s,rtfx,wer,cer,der,mel_s,enc_s,dec_s,status";
+
+/// Load one ASR model under `cfg`. `None` means the model or its cargo feature is unavailable.
+#[cfg(feature = "webgpu")]
+fn matrix_load_asr(
+    name: &str,
+    cfg: &parakeet_rs::ExecutionConfig,
+) -> Option<Result<MatrixRun, String>> {
+    match name {
+        "granite" if granite_available() => Some(
+            parakeet_rs::Parakeet::from_pretrained(granite_dir(), Some(cfg.clone()))
+                .map_err(|e| e.to_string())
+                .map(|mut m| -> MatrixRun {
+                    Box::new(move |a| (offline_transcribe(&mut m, a).0, None))
+                }),
+        ),
+        #[cfg(feature = "cohere")]
+        "cohere" if cohere_available() => Some(
+            parakeet_rs::CohereASR::from_pretrained(cohere_dir(), Some(cfg.clone()))
+                .map_err(|e| e.to_string())
+                .map(|mut m| -> MatrixRun {
+                    Box::new(move |a| {
+                        let t = m
+                            .transcribe_audio_long(a, "en", true, false)
+                            .expect("cohere long transcribe");
+                        (t, None)
+                    })
+                }),
+        ),
+        #[cfg(feature = "ark-asr")]
+        "ark" if ark_available() => Some(
+            parakeet_rs::ArkAsr::from_pretrained(ark_dir(), Some(cfg.clone()))
+                .map_err(|e| e.to_string())
+                .map(|mut m| -> MatrixRun {
+                    Box::new(move |a| (m.transcribe_long(a).expect("ark transcribe_long"), None))
+                }),
+        ),
+        "nemotron" if nemotron_available() => Some(
+            parakeet_rs::Nemotron::from_pretrained(nemotron_dir(), Some(cfg.clone()))
+                .map_err(|e| e.to_string())
+                .map(|mut m| -> MatrixRun {
+                    Box::new(move |a| {
+                        m.reset();
+                        m.set_record_stage_timing(true);
+                        let mut buf = a.to_vec();
+                        peak_normalize(&mut buf);
+                        let text = nemotron_transcribe(&mut m, &buf);
+                        let (mel, enc, dec) = m.stage_timing_ns();
+                        (text, Some((mel as f64 / 1e9, enc as f64 / 1e9, dec as f64 / 1e9)))
+                    })
+                }),
+        ),
+        #[cfg(feature = "multitalker")]
+        "multitalker" if multitalker_available() && sortformer_available() => Some(
+            parakeet_rs::MultitalkerASR::from_pretrained(
+                multitalker_dir(),
+                sortformer_onnx(),
+                Some(cfg.clone()),
+            )
+            .map_err(|e| e.to_string())
+            .map(|mut m| -> MatrixRun {
+                Box::new(move |a| {
+                    m.reset();
+                    let chunk = m.chunk_audio_samples();
+                    let mut buf = a.to_vec();
+                    peak_normalize(&mut buf);
+                    for c in buf.chunks(chunk) {
+                        let mut b = c.to_vec();
+                        b.resize(chunk, 0.0);
+                        m.transcribe_chunk(&b).expect("multitalker chunk");
+                    }
+                    for _ in 0..3 {
+                        m.transcribe_chunk(&vec![0.0; chunk]).expect("flush");
+                    }
+                    let text = m
+                        .get_transcripts()
+                        .iter()
+                        .map(|t| t.text.trim().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    (text, None)
+                })
+            }),
+        ),
+        _ => None,
+    }
+}
+
+/// Phase timing matrix for CPU vs WebGPU (opt-in, long running).
+///
+/// For each model (`PARAKEET_MATRIX_MODELS`, comma list from `granite,cohere,ark,nemotron,
+/// multitalker,sortformer`; default all) under the EP named by `PARAKEET_EP`, measures:
+///   - `audio_load_s`: WAV decode + resample of the clip
+///   - `model_load_s`: session creation (graph optimisation + EP init), once per model
+///   - `cold`: first run on the smoke clip after load (includes EP warm-up such as shader compilation)
+///   - `warm`: second run on the same clip
+///   - `long`: one run per extra clip (`PARAKEET_MATRIX_SAMPLES`, default `committee`)
+/// Nemotron also reports its internal mel / encoder / decoder split. The other frontends are
+/// internal to the library, so their mel cost is inside `infer_s`.
+/// Run one model per process (a WebGPU crash would otherwise end the whole matrix):
+///   PARAKEET_EP=webgpu PARAKEET_MATRIX_MODELS=granite cargo test --release \
+///     --features "webgpu ..." --test model_benchmark webgpu_phase_matrix -- --ignored --nocapture
+#[cfg(feature = "webgpu")]
+#[test]
+#[ignore]
+fn webgpu_phase_matrix() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    if ep_skip_if_unavailable("webgpu_phase_matrix") {
+        return;
+    }
+    let ep = requested_ep();
+    let cfg = execution_config();
+    let models: Vec<String> = std::env::var("PARAKEET_MATRIX_MODELS")
+        .unwrap_or_else(|_| "granite,cohere,ark,nemotron,multitalker,sortformer".into())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let extra: Vec<String> = std::env::var("PARAKEET_MATRIX_SAMPLES")
+        .unwrap_or_else(|_| "committee".into())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let Some(smoke) = sample_named("smoke") else {
+        skip("webgpu_phase_matrix", "samples/smoke missing");
+        return;
+    };
+    let rid = run_id();
+    let label = bench_label();
+
+    // (sample, run kind) in execution order.
+    let mut plan: Vec<(Sample, &str)> = vec![(smoke.clone(), "cold"), (smoke.clone(), "warm")];
+    for name in &extra {
+        match sample_named(name) {
+            Some(s) => plan.push((s, "long")),
+            None => skip("webgpu_phase_matrix", &format!("samples/{name} missing")),
+        }
+    }
+
+    let row = |model: &str, sample: &str, secs: f32, load: f32, mload: f32, kind: &str,
+               infer: f32, wer_cer: Option<(f32, f32)>, der: Option<f32>,
+               stages: Option<(f64, f64, f64)>, status: &str| {
+        let rtfx = if infer > 1e-6 { secs / infer } else { 0.0 };
+        let (w, c) = wer_cer.map(|(w, c)| (format!("{w:.4}"), format!("{c:.4}"))).unwrap_or_default();
+        let d = der.map(|d| format!("{d:.4}")).unwrap_or_default();
+        let (m, e, dd) = stages
+            .map(|(m, e, d)| (format!("{m:.3}"), format!("{e:.3}"), format!("{d:.3}")))
+            .unwrap_or_default();
+        eprintln!(
+            "  {model:<12} {ep:<7} {sample:<10} {kind:<5} load {load:>5.2}s model_load {mload:>6.2}s \
+             infer {infer:>8.2}s RTFx {rtfx:>6.1} WER {w:>7} DER {d:>7} mel/enc/dec {m}/{e}/{dd} {status}"
+        );
+        append_csv_row(
+            "webgpu_matrix.csv",
+            WEBGPU_MATRIX_HEADER,
+            &format!(
+                "{rid},{label},{model},{ep},{sample},{secs:.2},{load:.3},{mload:.3},{kind},{infer:.3},\
+{rtfx:.2},{w},{c},{d},{m},{e},{dd},{status}"
+            ),
+        );
+    };
+
+    for model in &models {
+        if model == "sortformer" {
+            #[cfg(feature = "sortformer")]
+            {
+                use parakeet_rs::sortformer::Sortformer;
+                if !sortformer_available() {
+                    skip("webgpu_phase_matrix", "sortformer onnx missing");
+                    continue;
+                }
+                let t = Instant::now();
+                let loaded = Sortformer::with_config(sortformer_onnx(), Some(cfg.clone()), diar_config());
+                let mload = t.elapsed().as_secs_f32();
+                let Ok(mut sf) = loaded else {
+                    row(model, "-", 0.0, 0.0, mload, "load", 0.0, None, None, None, "load_failed");
+                    continue;
+                };
+                for (sample, kind) in &plan {
+                    let t = Instant::now();
+                    let (audio, sr) = load_wav_mono_16k(&sample.wav);
+                    let aload = t.elapsed().as_secs_f32();
+                    let secs = audio.len() as f32 / 16_000.0;
+                    let t = Instant::now();
+                    let res = catch_unwind(AssertUnwindSafe(|| sf.diarize(audio, sr, 1)));
+                    let infer = t.elapsed().as_secs_f32();
+                    match res {
+                        Ok(Ok(segs)) => {
+                            let hyp: Vec<DiarSegment> = segs
+                                .iter()
+                                .map(|s| DiarSegment {
+                                    speaker: s.speaker_id,
+                                    start: s.start as f32 / 16_000.0,
+                                    end: s.end as f32 / 16_000.0,
+                                })
+                                .collect();
+                            let raw = std::fs::read_to_string(&sample.transcript).expect("transcript");
+                            let m = diarization_metrics(&parse_reference_turns(&raw, secs), &hyp, secs);
+                            row(model, &sample.name, secs, aload, mload, kind, infer, None, Some(m.der), None, "ok");
+                        }
+                        _ => row(model, &sample.name, secs, aload, mload, kind, infer, None, None, None, "run_failed"),
+                    }
+                }
+            }
+            continue;
+        }
+
+        let t = Instant::now();
+        let Some(loaded) = matrix_load_asr(model, &cfg) else {
+            skip("webgpu_phase_matrix", &format!("{model}: model or feature unavailable"));
+            continue;
+        };
+        let mload = t.elapsed().as_secs_f32();
+        let mut run = match loaded {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("  {model}: load failed: {e}");
+                row(model, "-", 0.0, 0.0, mload, "load", 0.0, None, None, None, "load_failed");
+                continue;
+            }
+        };
+        for (sample, kind) in &plan {
+            let t = Instant::now();
+            let (audio, _) = load_wav_mono_16k(&sample.wav);
+            let aload = t.elapsed().as_secs_f32();
+            let secs = audio.len() as f32 / 16_000.0;
+            let t = Instant::now();
+            let res = catch_unwind(AssertUnwindSafe(|| run(&audio)));
+            let infer = t.elapsed().as_secs_f32();
+            match res {
+                Ok((hyp, stages)) => {
+                    let reference = reference_for(sample);
+                    let wc = (wer(&reference, &hyp), cer(&reference, &hyp));
+                    row(model, &sample.name, secs, aload, mload, kind, infer, Some(wc), None, stages, "ok");
+                }
+                Err(_) => row(model, &sample.name, secs, aload, mload, kind, infer, None, None, None, "run_failed"),
+            }
+        }
+    }
+}
