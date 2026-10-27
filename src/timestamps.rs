@@ -98,22 +98,17 @@ pub(crate) fn group_by_words(tokens: &[TimedToken]) -> Vec<TimedToken> {
     let mut words = Vec::new();
     let mut current_word_text = String::new();
     let mut current_word_start = 0.0;
-    let mut last_word_lower = String::new();
 
     for (i, token) in tokens.iter().enumerate() {
         // Space-only tokens (from SentencePiece ▁ word boundaries) act as word separators
         // but don't contribute text. Save current word if we hit one.
         if token.text.trim().is_empty() {
             if !current_word_text.is_empty() {
-                let word_lower = current_word_text.to_lowercase();
-                if word_lower != last_word_lower {
-                    words.push(TimedToken {
-                        text: current_word_text.clone(),
-                        start: current_word_start,
-                        end: if i > 0 { tokens[i - 1].end } else { token.end },
-                    });
-                    last_word_lower = word_lower;
-                }
+                words.push(TimedToken {
+                    text: current_word_text.clone(),
+                    start: current_word_start,
+                    end: if i > 0 { tokens[i - 1].end } else { token.end },
+                });
                 current_word_text.clear();
             }
             continue;
@@ -138,39 +133,28 @@ pub(crate) fn group_by_words(tokens: &[TimedToken]) -> Vec<TimedToken> {
                 || i == 0;
 
         if starts_word && !current_word_text.is_empty() {
-            // Save previous word (with deduplication)
-            let word_lower = current_word_text.to_lowercase();
-            if word_lower != last_word_lower {
-                words.push(TimedToken {
-                    text: current_word_text.clone(),
-                    start: current_word_start,
-                    end: tokens[i - 1].end,
-                });
-                last_word_lower = word_lower;
-            }
+            words.push(TimedToken {
+                text: current_word_text.clone(),
+                start: current_word_start,
+                end: tokens[i - 1].end,
+            });
             current_word_text.clear();
         }
 
-        // Start new word or append to current
         if current_word_text.is_empty() {
             current_word_start = token.start;
         }
 
-        // Add token text, removing word boundary markers
         let token_text = token.text.trim_start_matches('▁').trim_start_matches(' ');
         current_word_text.push_str(token_text);
     }
 
-    // Add final word
     if !current_word_text.is_empty() {
-        let word_lower = current_word_text.to_lowercase();
-        if word_lower != last_word_lower {
-            words.push(TimedToken {
-                text: current_word_text,
-                start: current_word_start,
-                end: last_token.end,
-            });
-        }
+        words.push(TimedToken {
+            text: current_word_text,
+            start: current_word_start,
+            end: last_token.end,
+        });
     }
 
     words
@@ -348,6 +332,31 @@ mod tests {
 
         let result = format_sentence(&words);
         assert_eq!(result, "uh uh hello");
+    }
+
+    #[test]
+    fn test_word_grouping_keeps_repeated_words() {
+        let tokens: Vec<TimedToken> = ["▁the", "▁the", "▁thing"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TimedToken {
+                text: (*t).to_string(),
+                start: i as f32,
+                end: i as f32 + 1.0,
+            })
+            .collect();
+        let words = group_by_words(&tokens);
+        let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, ["the", "the", "thing"]);
+        assert_eq!(words[0].start, 0.0);
+        assert_eq!(words[0].end, 1.0);
+        assert_eq!(words[1].start, 1.0);
+        assert_eq!(words[1].end, 2.0);
+        assert_eq!(words[2].end, 3.0);
+
+        let sentences = group_by_sentences(&tokens);
+        assert_eq!(sentences.len(), 1);
+        assert_eq!(sentences[0].text, "the the thing");
     }
 
     #[test]
