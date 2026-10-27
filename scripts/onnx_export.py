@@ -85,8 +85,12 @@ def export(module, inputs, path, input_names, output_names, dynamic_axes=None):
             dynamo=True,
         )
     # Dim.AUTO lets torch.export fix a size it cannot keep dynamic; refuse that.
+    # Legacy dynamic_axes dicts also name outputs. Shapes above use input_names
+    # only, and outputs are not graph inputs, so skip those keys.
     graph_inputs = {v.name: v for v in onnx.load(path, load_external_data=False).graph.input}
     for name, axes in bounds.items():
+        if name not in input_names:
+            continue
         dims = graph_inputs[name].type.tensor_type.shape.dim
         fixed = [a for a in axes if dims[a].HasField("dim_value")]
         if fixed:
