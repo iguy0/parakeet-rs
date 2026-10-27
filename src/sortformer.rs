@@ -1622,6 +1622,19 @@ impl Sortformer {
         Ok(spectrogram)
     }
 
+    /// `(mel, time)` log-mel to the model's `(batch, time, mel)` tensor.
+    ///
+    /// `Array2::t().to_owned()` keeps Fortran layout. ORT refuses a
+    /// non-standard view ("Array has a non-contiguous layout"), and a
+    /// full-size chunk is passed through `from_array_view` without another copy.
+    fn model_mel_layout(log_mel_spec: Array2<f32>) -> Array3<f32> {
+        log_mel_spec
+            .t()
+            .as_standard_layout()
+            .into_owned()
+            .insert_axis(Axis(0))
+    }
+
     fn extract_mel_features(&self, audio: &[f32]) -> Result<Array3<f32>> {
         // 1. Add dither (small random noise to prevent log(0))
         // NeMo uses dither=1e-5, but for determinism we skip random noise
@@ -1641,7 +1654,7 @@ impl Sortformer {
         let log_mel_spec = mel_spec.mapv(|x| (x + LOG_ZERO_GUARD).ln());
 
         // Transpose to (batch, time, features) - NeMo outputs (B, D, T), model expects (B, T, D)
-        Ok(log_mel_spec.t().to_owned().insert_axis(Axis(0)))
+        Ok(Self::model_mel_layout(log_mel_spec))
     }
 }
 
@@ -1686,6 +1699,22 @@ mod tests {
             correct_frames > interior_frames / 2,
             "Expected bin {expected_bin} to dominate, but only {correct_frames}/{interior_frames}"
         );
+    }
+
+    #[test]
+    fn model_mel_layout_is_standard_and_time_major() {
+        let n_mels = 4;
+        let n_frames = 6;
+        let log_mel = Array2::from_shape_fn((n_mels, n_frames), |(mel, frame)| {
+            (mel * 10 + frame) as f32
+        });
+        let features = Sortformer::model_mel_layout(log_mel.clone());
+        assert!(
+            features.is_standard_layout(),
+            "ORT from_array_view rejects a Fortran mel tensor"
+        );
+        assert_eq!(features.shape(), &[1, n_frames, n_mels]);
+        assert_eq!(features[[0, 3, 2]], log_mel[[2, 3]]);
     }
 
     #[test]
