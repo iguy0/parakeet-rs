@@ -11,9 +11,15 @@ parser.add_argument("--spkcache-len", help = "The total number of frames in the 
 
 args = parser.parse_args()
 
+import os
+import tempfile
+
 import torch
 import types
 from nemo.collections.asr.models import SortformerEncLabelModel
+
+import onnx
+import onnx_export
 
 print(f"PyTorch version: {torch.__version__}")
 
@@ -69,29 +75,23 @@ print(f"  chunk    {chunk.shape}")
 print(f"  spkcache: {spkcache.shape}")
 print(f"  fif:     {fifo.shape}")
 
-torch.onnx.export(
-    model,
-    input_example,
-    args.output_path,
-    input_names=["chunk", "chunk_lengths", "spkcache", "spkcache_lengths", "fifo", "fifo_lengths"],
-    output_names=["spkcache_fifo_chunk_preds", "chunk_pre_encode_embs", "chunk_pre_encode_lengths"],
-    dynamic_axes={
-        "chunk": {0: "batch", 1: "time_chunk"},
-        "spkcache": {0: "batch", 1: "time_cache"},
-        "fifo": {0: "batch", 1: "time_fifo"},
-        "spkcache_fifo_chunk_preds": {0: "batch", 1: "time_out"},
-        "chunk_pre_encode_embs": {0: "batch", 1: "time_pre_encode"}
-    },
-    opset_version=17,
-    dynamo=False,
-    verbose=False,
-)
-
-print(f"xported to: {args.output_path}")
-
-
-import onnx
-model_onnx = onnx.load(args.output_path)
+with tempfile.TemporaryDirectory() as tmp:
+    raw_path = os.path.join(tmp, "raw.onnx")
+    onnx_export.export(
+        model,
+        input_example,
+        raw_path,
+        input_names=["chunk", "chunk_lengths", "spkcache", "spkcache_lengths", "fifo", "fifo_lengths"],
+        output_names=["spkcache_fifo_chunk_preds", "chunk_pre_encode_embs", "chunk_pre_encode_lengths"],
+        dynamic_axes={
+            "chunk": {0: "batch", 1: "time_chunk"},
+            "spkcache": {0: "batch", 1: "time_cache"},
+            "fifo": {0: "batch", 1: "time_fifo"},
+            "spkcache_fifo_chunk_preds": {0: "batch", 1: "time_out"},
+            "chunk_pre_encode_embs": {0: "batch", 1: "time_pre_encode"},
+        },
+    )
+    model_onnx = onnx.load(raw_path)
 print("\n verify input shapes:")
 for inp in model_onnx.graph.input:
     dims = [d.dim_param if d.dim_param else d.dim_value for d in inp.type.tensor_type.shape.dim]
@@ -104,12 +104,16 @@ if fifo_dim1.dim_param:
 else:
     print(f"\n FIFO is fixed: {fifo_dim1.dim_value}")
 
-model_onnx.metadata_props.append(onnx.StringStringEntryProto(key="chunk_len", value=str(args.chunk_len)))
-model_onnx.metadata_props.append(onnx.StringStringEntryProto(key="fifo_len", value=str(args.fifo_len)))
-model_onnx.metadata_props.append(onnx.StringStringEntryProto(key="spkcache_len", value=str(args.spkcache_len)))
-model_onnx.metadata_props.append(onnx.StringStringEntryProto(key="right_context", value=str(args.right_context)))
-model_onnx.metadata_props.append(onnx.StringStringEntryProto(key="num_speakers", value="4"))
-
 print("\nSaving model with custom metadata")
-
-onnx.save(model_onnx, args.output_path)
+onnx_export.save(
+    model_onnx,
+    args.output_path,
+    metadata={
+        "chunk_len": str(args.chunk_len),
+        "fifo_len": str(args.fifo_len),
+        "spkcache_len": str(args.spkcache_len),
+        "right_context": str(args.right_context),
+        "num_speakers": "4",
+    },
+)
+print(f"xported to: {args.output_path}")

@@ -14,8 +14,8 @@
 # encoder.forward_for_export(), keeping the hooks active so the tracer follows
 # the data flow through the kernel FFNs.
 #
-# Requirements (Python 3.12, PyTorch < 2.9):
-#   pip install nemo_toolkit[asr] onnx onnxruntime
+# Requirements (Python 3.12, torch >= 2.9, onnxscript):
+#   pip install nemo_toolkit[asr] onnx onnxruntime onnxscript
 #
 # Usage:
 #   python export_multitalker.py
@@ -33,6 +33,7 @@ import json
 import os
 import sys
 import tarfile
+import tempfile
 import traceback
 import zipfile
 
@@ -40,6 +41,8 @@ import onnx
 import torch
 import torch.nn as nn
 import nemo.collections.asr as nemo_asr
+
+import onnx_export
 
 
 DEFAULT_NEMO_PATH = "../multitalker-parakeet-streaming-0.6b-v1/multitalker-parakeet-streaming-0.6b-v1.nemo"
@@ -287,16 +290,17 @@ def export_decoder_joint(asr_model, output_path, config):
                 print(f"    output[{i}]: {o}")
 
     print("  Exporting decoder_joint...")
-    torch.onnx.export(
-        wrapper,
-        (dummy_encoder, dummy_targets, dummy_state1, dummy_state2),
-        output_path,
-        input_names=["encoder_outputs", "targets", "input_states_1", "input_states_2"],
-        output_names=["outputs", "prednet_lengths", "states_1", "states_2"],
-        dynamic_axes={"encoder_outputs": {1: "enc_time"}},
-        opset_version=17,
-        do_constant_folding=True,
-    )
+    with tempfile.TemporaryDirectory() as tmp:
+        raw_path = os.path.join(tmp, "decoder_joint.onnx")
+        onnx_export.export(
+            wrapper,
+            (dummy_encoder, dummy_targets, dummy_state1, dummy_state2),
+            raw_path,
+            input_names=["encoder_outputs", "targets", "input_states_1", "input_states_2"],
+            output_names=["outputs", "prednet_lengths", "states_1", "states_2"],
+            dynamic_axes={"encoder_outputs": {1: "enc_time"}},
+        )
+        onnx_export.save(onnx_export.fold_constants(onnx.load(raw_path)), output_path)
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"  decoder_joint.onnx: {size_mb:.1f}MB")
@@ -308,6 +312,8 @@ def custom_export_encoder(asr_model, output_path, config):
     This is the primary export path. It keeps hooks active on encoder layers and
     sets the traced spk_targets on the model before calling forward_for_export().
     """
+    onnx_export.use_sdpa(asr_model.encoder)
+    onnx_export.exact_position_slices(asr_model.encoder)
     wrapper = MultitalkerEncoderExport(asr_model)
     wrapper.eval()
 
@@ -349,36 +355,30 @@ def custom_export_encoder(asr_model, output_path, config):
     print(f"  Signal shape: [1, 128, {time_steps}], cache: [{batch}, {n_layers}, {left_context}, {d_model}]")
     print(f"  Exporting encoder with {len(input_names)} inputs...")
 
-    torch.onnx.export(
-        wrapper,
-        (dummy_signal, dummy_length, dummy_cache_channel, dummy_cache_time,
-         dummy_cache_len, dummy_spk_targets, dummy_bg_spk_targets),
-        output_path,
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes=dynamic_axes,
-        opset_version=17,
-        do_constant_folding=True,
-    )
+    data_file = output_path + ".data"
+    with tempfile.TemporaryDirectory() as tmp:
+        raw_path = os.path.join(tmp, "encoder.onnx")
+        onnx_export.export(
+            wrapper,
+            (dummy_signal, dummy_length, dummy_cache_channel, dummy_cache_time,
+             dummy_cache_len, dummy_spk_targets, dummy_bg_spk_targets),
+            raw_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+        )
+        print("  Consolidating encoder weights into single .data file...")
+        model_proto = onnx.load(raw_path)
+        if os.path.exists(data_file):
+            os.remove(data_file)
+        onnx_export.save(model_proto, output_path, "encoder.onnx.data")
 
     # Verify spk_targets wasn't constant-folded out of the graph
-    print("  Consolidating encoder weights into single .data file...")
-    model_proto = onnx.load(output_path)
-
-    input_names_exported = [inp.name for inp in model_proto.graph.input]
+    saved = onnx.load(output_path, load_external_data=False)
+    input_names_exported = [inp.name for inp in saved.graph.input]
     if "spk_targets" not in input_names_exported:
         print("  WARNING: spk_targets was constant-folded out of the ONNX graph!")
         raise RuntimeError("spk_targets constant-folded; falling back to alternative export")
-
-    data_file = output_path + ".data"
-    if os.path.exists(data_file):
-        os.remove(data_file)
-    onnx.save(
-        model_proto, output_path,
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=os.path.basename(output_path) + ".data",
-    )
 
     # Clean up scattered weight files from the initial export
     output_dir = os.path.dirname(output_path)
@@ -516,6 +516,8 @@ def fallback_export_encoder(asr_model, output_path, config):
             return (rets[0], rets[1],
                     rets[2].transpose(0, 1), rets[3].transpose(0, 1), rets[4])
 
+    onnx_export.use_sdpa(asr_model.encoder)
+    onnx_export.exact_position_slices(asr_model.encoder)
     wrapper = ExplicitKernelEncoder(
         asr_model.encoder, asr_model.spk_kernels,
         asr_model.bg_spk_kernels, spk_kernel_layers,
@@ -550,7 +552,7 @@ def fallback_export_encoder(asr_model, output_path, config):
     }
 
     print(f"  Exporting encoder (fallback, explicit kernel injection) with {len(input_names)} inputs...")
-    torch.onnx.export(
+    onnx_export.export(
         wrapper,
         (dummy_signal, dummy_length, dummy_cache_channel, dummy_cache_time,
          dummy_cache_len, dummy_spk_targets, dummy_bg_spk_targets),
@@ -558,8 +560,6 @@ def fallback_export_encoder(asr_model, output_path, config):
         input_names=input_names,
         output_names=output_names,
         dynamic_axes=dynamic_axes,
-        opset_version=17,
-        do_constant_folding=True,
     )
 
     model_proto = onnx.load(output_path)

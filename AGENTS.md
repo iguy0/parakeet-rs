@@ -199,15 +199,18 @@ Post-processing: `DiarizationConfig` presets (`callhome()`, `dihard3()`, `ultra_
 
 | Script | Purpose | Rust counterpart |
 |--------|---------|------------------|
-| `scripts/export_nemotron_streaming.py` | Nemotron EN ONNX export; `--right-context` sets latency | `nemotron.rs` `CHUNK_SIZE`, `PRE_ENCODE_CACHE` |
-| `scripts/export_nemotron_streaming_multilingual.py` | Multilingual 3.5 export | Same `Nemotron` API, auto-detects mode |
+| `scripts/onnx_export.py` | Shared dynamo ONNX export helper, opset 23 | Used by the export scripts below |
+| `scripts/export_parakeet_ctc.py` | Parakeet CTC 0.6B ONNX export (`logits`) | `parakeet.rs`, `model.rs` |
+| `scripts/export_parakeet_tdt.py` | Parakeet TDT 0.6B v3 ONNX export; `--ultra` loads Moondream's Parakeet Ultra weights into the same graph | `parakeet_tdt.rs`, `model_tdt.rs` |
+| `scripts/export_nemotron_streaming.py` | Nemotron EN ONNX export; `--right-context` sets latency. Graphs are exported with `scripts/onnx_export.py` | `nemotron.rs` `CHUNK_SIZE`, `PRE_ENCODE_CACHE` |
+| `scripts/export_nemotron_streaming_multilingual.py` | Multilingual 3.5 export. Graphs are exported with `scripts/onnx_export.py` | Same `Nemotron` API, auto-detects mode |
 | `scripts/quantize_nemotron_streaming.py` | Local INT8/INT4 quantization *(fork-only)* | Load quantized ONNX like any other model dir |
 | `scripts/export_realtime_eou_120m.py` | EOU model export | `parakeet_eou.rs` constants |
 | `scripts/export_parakeet_unified.py` | Unified RNNT export | `parakeet_unified.rs` |
-| `scripts/export_multitalker.py` | Multitalker encoder/decoder export | `multitalker.rs` |
-| `scripts/export_diar_sortformer.py` | Sortformer 4spk with tunable chunk/FIFO/cache params | `sortformer.rs` constants (overridable via ONNX metadata) |
-| `scripts/export_ultra_diar_8spk.py` | 8-speaker Sortformer export | `sortformer.rs` reads `num_speakers` from ONNX metadata |
-| `scripts/export_nemotron3_diarization.py` | Nemotron-3-Diarization export (+ optional INT8) | `sortformer.rs` reads `sil_emb`, `scores_boost_latest`, `spkcache_sil_frames_per_spk` from ONNX metadata |
+| `scripts/export_multitalker.py` | Multitalker encoder/decoder export. Graphs are exported with `scripts/onnx_export.py` | `multitalker.rs` |
+| `scripts/export_diar_sortformer.py` | Sortformer 4spk with tunable chunk/FIFO/cache params. Graphs are exported with `scripts/onnx_export.py` | `sortformer.rs` constants (overridable via ONNX metadata) |
+| `scripts/export_ultra_diar_8spk.py` | 8-speaker Sortformer export. Graphs are exported with `scripts/onnx_export.py` | `sortformer.rs` reads `num_speakers` from ONNX metadata |
+| `scripts/export_nemotron3_diarization.py` | Nemotron-3-Diarization export (+ optional INT8). Graphs are exported with `scripts/onnx_export.py` | `sortformer.rs` reads `sil_emb`, `scores_boost_latest`, `spkcache_sil_frames_per_spk` from ONNX metadata |
 | `scripts/benchmark/run_all.sh` | Greedy-vs-beam example harness (env-driven model/clip selection) | Drives `examples/*` with `--decoding greedy|beam` |
 | `scripts/benchmark/compare_greedy_beam.py` | Transcript edit-distance / optional WER diff for greedy vs beam | Consumed by `run_all.sh` |
 | `scripts/patch_ctc_onnx_metadata.py` | Stamps `ctc_*` `metadata_props` (blank id, token offset, frontend deltas/stacking/normalization, encoder subsample) onto third-party single-file CTC ONNX graphs | `config.rs` `CtcConfig::from_metadata`, `model.rs` `ctc_config_from_session` |

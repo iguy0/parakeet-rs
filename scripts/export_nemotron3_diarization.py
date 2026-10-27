@@ -54,12 +54,15 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 import types
 from pathlib import Path
 
 import numpy as np
 import onnx
 import torch
+
+import onnx_export
 
 PRESETS = {
     # name: (chunk_len, right_context, fifo_len, spkcache_update_period)
@@ -110,11 +113,14 @@ def install_onnx_attention_shims() -> None:
     from nemo.collections.asr.modules import transformer_encoder as te
 
     def dense_block_mask(mask_mod, B, H, Q_LEN, KV_LEN, device=None, **_):
-        b = torch.arange(B, device=device).view(B, 1, 1, 1)
-        h = torch.zeros(1, 1, 1, 1, dtype=torch.long, device=device)
-        q = torch.arange(Q_LEN, device=device).view(1, 1, Q_LEN, 1)
-        kv = torch.arange(KV_LEN, device=device).view(1, 1, 1, KV_LEN)
-        return mask_mod(b, h, q, kv).expand(B, 1, Q_LEN, KV_LEN)
+        b = torch.arange(B or 1, device=device).view(-1, 1, 1, 1)
+        h = torch.arange(H or 1, device=device).view(1, -1, 1, 1)
+        q = torch.arange(Q_LEN, device=device).view(1, 1, -1, 1)
+        kv = torch.arange(KV_LEN, device=device).view(1, 1, 1, -1)
+        # ORT Attention does not broadcast the mask. The query axis and the
+        # head axis both have to match q.
+        dense = mask_mod(b, h, q, kv)
+        return dense.expand(b.shape[0], h.shape[1], q.shape[2], kv.shape[3])
 
     def sdpa(q, k, v, block_mask=None, score_mod=None, **_):
         if score_mod is not None:
@@ -183,6 +189,7 @@ def export_model(args: argparse.Namespace, model) -> Path:
                 refs[seed] = [t.cpu().numpy() for t in model.forward_for_export(*inputs)]
     print("encoder attn_mode:", model.encoder.attn_mode,
           "causal_tail_len:", getattr(model.encoder, "causal_tail_len", None))
+    onnx_export.use_sdpa(model)
     install_onnx_attention_shims()
 
     # Trace the NeMo export forward directly (same 6-in / 3-out contract).
@@ -191,34 +198,34 @@ def export_model(args: argparse.Namespace, model) -> Path:
     )
     inputs = example_inputs(args)
 
-    torch.onnx.export(
-        model,
-        inputs,
-        str(out),
-        input_names=[
-            "chunk",
-            "chunk_lengths",
-            "spkcache",
-            "spkcache_lengths",
-            "fifo",
-            "fifo_lengths",
-        ],
-        output_names=[
-            "spkcache_fifo_chunk_preds",
-            "chunk_pre_encode_embs",
-            "chunk_pre_encode_lengths",
-        ],
-        dynamic_axes={
-            "chunk": {0: "batch", 1: "time_chunk"},
-            "spkcache": {0: "batch", 1: "time_cache"},
-            "fifo": {0: "batch", 1: "time_fifo"},
-            "spkcache_fifo_chunk_preds": {0: "batch", 1: "time_out"},
-            "chunk_pre_encode_embs": {0: "batch", 1: "time_pre_encode"},
-        },
-        opset_version=17,
-        dynamo=False,
-        verbose=False,
-    )
+    with tempfile.TemporaryDirectory() as tmp:
+        raw_path = str(Path(tmp) / "raw.onnx")
+        onnx_export.export(
+            model,
+            inputs,
+            raw_path,
+            input_names=[
+                "chunk",
+                "chunk_lengths",
+                "spkcache",
+                "spkcache_lengths",
+                "fifo",
+                "fifo_lengths",
+            ],
+            output_names=[
+                "spkcache_fifo_chunk_preds",
+                "chunk_pre_encode_embs",
+                "chunk_pre_encode_lengths",
+            ],
+            dynamic_axes={
+                "chunk": {0: "batch", 1: "time_chunk"},
+                "spkcache": {0: "batch", 1: "time_cache"},
+                "fifo": {0: "batch", 1: "time_fifo"},
+                "spkcache_fifo_chunk_preds": {0: "batch", 1: "time_out"},
+                "chunk_pre_encode_embs": {0: "batch", 1: "time_pre_encode"},
+            },
+        )
+        proto = _onnx.load(raw_path)
 
     metadata = {
         "model": "Nemotron-3-Diarization",
@@ -234,12 +241,8 @@ def export_model(args: argparse.Namespace, model) -> Path:
         sil = sm.learnable_sil_emb.detach().cpu().float().numpy()
         metadata["sil_emb"] = ",".join(f"{v:.9g}" for v in sil)
 
-    # Keep the weights in an external-data file if the graph is large
-    proto = _onnx.load(str(out))
     del proto.metadata_props[:]
-    for k, v in metadata.items():
-        proto.metadata_props.append(_onnx.StringStringEntryProto(key=k, value=v))
-    _onnx.save(proto, str(out))
+    onnx_export.save(proto, str(out), metadata=metadata)
 
     print("ONNX inputs :", [i.name for i in proto.graph.input])
     print("ONNX outputs:", [o.name for o in proto.graph.output])

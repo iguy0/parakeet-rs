@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 import types
 from pathlib import Path
 
 import numpy as np
 import onnx
 import torch
+
+import onnx_export
 
 # 8spk inference defaults from ultra_diar_streaming_sortformer_8spk_v1 README
 DEFAULT_CHUNK_LEN = 340
@@ -152,36 +155,34 @@ def export_model(args: argparse.Namespace) -> Path:
     print(f"  spkcache: {tuple(spkcache.shape)}")
     print(f"  fifo:     {tuple(fifo.shape)}")
 
-    torch.onnx.export(
-        model,
-        input_example,
-        str(output_path),
-        input_names=[
-            "chunk",
-            "chunk_lengths",
-            "spkcache",
-            "spkcache_lengths",
-            "fifo",
-            "fifo_lengths",
-        ],
-        output_names=[
-            "spkcache_fifo_chunk_preds",
-            "chunk_pre_encode_embs",
-            "chunk_pre_encode_lengths",
-        ],
-        dynamic_axes={
-            "chunk": {0: "batch", 1: "time_chunk"},
-            "spkcache": {0: "batch", 1: "time_cache"},
-            "fifo": {0: "batch", 1: "time_fifo"},
-            "spkcache_fifo_chunk_preds": {0: "batch", 1: "time_out"},
-            "chunk_pre_encode_embs": {0: "batch", 1: "time_pre_encode"},
-        },
-        opset_version=17,
-        dynamo=False,
-        verbose=False,
-    )
-
-    model_onnx = onnx.load(str(output_path))
+    with tempfile.TemporaryDirectory() as tmp:
+        raw_path = str(Path(tmp) / "raw.onnx")
+        onnx_export.export(
+            model,
+            input_example,
+            raw_path,
+            input_names=[
+                "chunk",
+                "chunk_lengths",
+                "spkcache",
+                "spkcache_lengths",
+                "fifo",
+                "fifo_lengths",
+            ],
+            output_names=[
+                "spkcache_fifo_chunk_preds",
+                "chunk_pre_encode_embs",
+                "chunk_pre_encode_lengths",
+            ],
+            dynamic_axes={
+                "chunk": {0: "batch", 1: "time_chunk"},
+                "spkcache": {0: "batch", 1: "time_cache"},
+                "fifo": {0: "batch", 1: "time_fifo"},
+                "spkcache_fifo_chunk_preds": {0: "batch", 1: "time_out"},
+                "chunk_pre_encode_embs": {0: "batch", 1: "time_pre_encode"},
+            },
+        )
+        model_onnx = onnx.load(raw_path)
     print("\nONNX inputs:")
     for inp in model_onnx.graph.input:
         dims = [
@@ -207,12 +208,7 @@ def export_model(args: argparse.Namespace) -> Path:
         "model": "ultra_diar_streaming_sortformer_8spk_v1",
     }
     del model_onnx.metadata_props[:]
-    for key, value in metadata.items():
-        model_onnx.metadata_props.append(
-            onnx.StringStringEntryProto(key=key, value=value)
-        )
-
-    onnx.save(model_onnx, str(output_path))
+    onnx_export.save(model_onnx, str(output_path), metadata=metadata)
     print(f"\nExported to: {output_path}")
     print("Metadata:", metadata)
     return output_path
