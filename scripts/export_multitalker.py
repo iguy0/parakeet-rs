@@ -161,10 +161,20 @@ def dynamic_quantise(output_dir, meta_data):
     decoder_out = os.path.join(output_dir, "decoder_joint.int8.onnx")
 
     print("Quantising encoder to int8 (dynamic)...")
-    quantize_dynamic(encoder_in, encoder_out, weight_type=QuantType.QUInt8)
+    quantize_dynamic(
+        encoder_in,
+        encoder_out,
+        weight_type=QuantType.QUInt8,
+        op_types_to_quantize=onnx_export.INT8_OPS,
+    )
 
     print("Quantising decoder_joint to int8 (dynamic)...")
-    quantize_dynamic(decoder_in, decoder_out, weight_type=QuantType.QInt8)
+    quantize_dynamic(
+        decoder_in,
+        decoder_out,
+        weight_type=QuantType.QInt8,
+        op_types_to_quantize=onnx_export.INT8_OPS,
+    )
 
     print("Adding metadata...")
     add_meta_data(encoder_out, meta_data)
