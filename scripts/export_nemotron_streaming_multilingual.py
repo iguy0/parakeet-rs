@@ -66,7 +66,6 @@
 #     config.json           -- streaming params, cache shapes, prompt_dictionary
 
 import argparse
-import functools
 import gc
 import glob
 import json
@@ -84,6 +83,7 @@ import torch
 from omegaconf import OmegaConf
 
 import nemo.collections.asr as nemo_asr
+import onnx_export
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -124,31 +124,6 @@ except ImportError:
     pass
 
 # ---------------------------------------------------------------------------
-# PyTorch 2.9+ defaults torch.onnx.export to the dynamo path, which silently
-# breaks tracing for this model. I force it back to the legacy exporter.
-# Same shim I use in the English-only script.
-# ---------------------------------------------------------------------------
-
-pytorch_version = tuple(
-    int(x) for x in torch.__version__.split("+")[0].split(".")[:2]
-)
-print(f"PyTorch version: {torch.__version__}")
-
-_PATCH_MARKER = "_legacy_onnx_patched"
-if pytorch_version >= (2, 9) and not getattr(torch.onnx.export, _PATCH_MARKER, False):
-    print("  Patching torch.onnx.export for PyTorch 2.9+ (dynamo=False)")
-    _original_torch_onnx_export = torch.onnx.export
-
-    @functools.wraps(_original_torch_onnx_export)
-    def _patched_onnx_export(*pargs, **kwargs):
-        if "dynamo" not in kwargs:
-            kwargs["dynamo"] = False
-        return _original_torch_onnx_export(*pargs, **kwargs)
-
-    _patched_onnx_export._legacy_onnx_patched = True
-    torch.onnx.export = _patched_onnx_export
-
-# ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 
@@ -161,6 +136,8 @@ print(f"\nLoading model from: {args.input_path}")
 
 model = nemo_asr.models.ASRModel.restore_from(args.input_path, map_location=device)
 model.eval()
+onnx_export.use_sdpa(model.encoder)
+onnx_export.exact_position_slices(model.encoder)
 
 print(f"  Model class : {type(model).__name__}")
 print(f"  Encoder type: {type(model.encoder).__name__}")
@@ -395,7 +372,7 @@ output_names = [
 
 temp_encoder_path = os.path.join(OUTPUT_DIR, "encoder_temp.onnx")
 
-torch.onnx.export(
+onnx_export.export(
     wrapper,
     (
         processed_signal, processed_signal_length,
@@ -405,7 +382,6 @@ torch.onnx.export(
     temp_encoder_path,
     input_names=input_names,
     output_names=output_names,
-    opset_version=17,
     dynamic_axes={
         "processed_signal":        {0: "batch", 2: "time"},
         "processed_signal_length": {0: "batch"},
@@ -424,24 +400,13 @@ print("  Consolidating encoder weights into single file...")
 encoder_model = onnx.load(temp_encoder_path, load_external_data=True)
 final_encoder_path = os.path.join(OUTPUT_DIR, "encoder.onnx")
 
-# Stamp the latency profile into the ONNX metadata so the Rust loader can
-# pick it up per export (same pattern as export_diar_sortformer.py).
 pre_encode_cache = int(getattr(streaming_cfg, "pre_encode_cache_size", [0, 9])[1])
-encoder_model.metadata_props.append(
-    onnx.StringStringEntryProto(key="chunk_size_output_frames", value=str(chunk_size))
-)
-encoder_model.metadata_props.append(
-    onnx.StringStringEntryProto(key="pre_encode_cache", value=str(pre_encode_cache))
-)
 print(f"  Metadata: chunk_size_output_frames={chunk_size}, pre_encode_cache={pre_encode_cache}")
-
-onnx.save_model(
+onnx_export.save(
     encoder_model,
     final_encoder_path,
-    save_as_external_data=True,
-    all_tensors_to_one_file=True,
-    location="encoder.onnx.data",
-    size_threshold=0,
+    "encoder.onnx.data",
+    {"chunk_size_output_frames": chunk_size, "pre_encode_cache": pre_encode_cache},
 )
 
 del encoder_model
@@ -463,25 +428,14 @@ print("  Encoder saved: encoder.onnx + encoder.onnx.data")
 # ---------------------------------------------------------------------------
 # Decoder/joint export. There is nothing prompt-specific here -- the RNNT
 # decoder and joint network are identical to the English-only model's, just
-# wider vocab (~13k vs 1024). I let NeMo's own exporter handle them.
+# wider vocab (~13k vs 1024).
 # ---------------------------------------------------------------------------
 
 print("\nExporting decoder/joint...")
 
-temp_decoder_prefix = os.path.join(OUTPUT_DIR, "temp_model")
-with torch.no_grad():
-    model.export(output=temp_decoder_prefix + ".onnx", check_trace=False)
-
-# NeMo's model.export() dumps both encoder and decoder. I already have my own
-# encoder export with the prompt input, so I keep only the decoder_joint here
-# and discard the rest.
 final_decoder_path = os.path.join(OUTPUT_DIR, "decoder_joint.onnx")
-for f in glob.glob(os.path.join(OUTPUT_DIR, "*.onnx")):
-    fname = os.path.basename(f).lower()
-    if "decoder" in fname and "joint" in fname:
-        if f != final_decoder_path:
-            shutil.move(f, final_decoder_path)
-        break
+onnx_export.export_decoder_joint(model, final_decoder_path)
+print("  Decoder saved: decoder_joint.onnx")
 
 keep = {"encoder.onnx", "encoder.onnx.data", "decoder_joint.onnx", "tokenizer.model"}
 for f in glob.glob(os.path.join(OUTPUT_DIR, "*")):
@@ -490,8 +444,6 @@ for f in glob.glob(os.path.join(OUTPUT_DIR, "*")):
             os.remove(f)
         except OSError:
             pass
-
-print("  Decoder saved: decoder_joint.onnx")
 
 # ---------------------------------------------------------------------------
 # Save config.json. The Rust loader auto-detects the multilingual variant by
