@@ -61,6 +61,7 @@ from pathlib import Path
 
 import numpy as np
 import onnx
+import onnx_export
 import onnxruntime as ort
 from onnxruntime.quantization import QuantType, quantize_dynamic
 
@@ -226,6 +227,7 @@ def quantize_to_tmp(
         model_input=str(src),
         model_output=str(tmp_dest),
         weight_type=weight_type,
+        op_types_to_quantize=onnx_export.INT8_OPS,
         use_external_data_format=use_external_data,
     )
     return tmp_dest

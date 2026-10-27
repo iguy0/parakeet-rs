@@ -390,16 +390,6 @@ def custom_export_encoder(asr_model, output_path, config):
         print("  WARNING: spk_targets was constant-folded out of the ONNX graph!")
         raise RuntimeError("spk_targets constant-folded; falling back to alternative export")
 
-    # Clean up scattered weight files from the initial export
-    output_dir = os.path.dirname(output_path)
-    for f in os.listdir(output_dir):
-        fpath = os.path.join(output_dir, f)
-        if os.path.isfile(fpath) and f.startswith(
-            ("onnx__MatMul_", "encoder.", "Constant_", "spk_kernels.", "bg_spk_kernels.")
-        ):
-            if not f.endswith((".onnx", ".onnx.data")):
-                os.remove(fpath)
-
     print(f"  encoder.onnx: {os.path.getsize(output_path) / (1024*1024):.1f}MB"
           f" + {os.path.getsize(data_file) / (1024*1024):.1f}MB data")
 
@@ -562,25 +552,33 @@ def fallback_export_encoder(asr_model, output_path, config):
     }
 
     print(f"  Exporting encoder (fallback, explicit kernel injection) with {len(input_names)} inputs...")
-    onnx_export.export(
-        wrapper,
-        (dummy_signal, dummy_length, dummy_cache_channel, dummy_cache_time,
-         dummy_cache_len, dummy_spk_targets, dummy_bg_spk_targets),
-        output_path,
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes=dynamic_axes,
-    )
+    data_file = output_path + ".data"
+    with tempfile.TemporaryDirectory() as tmp:
+        raw_path = os.path.join(tmp, "encoder.onnx")
+        onnx_export.export(
+            wrapper,
+            (dummy_signal, dummy_length, dummy_cache_channel, dummy_cache_time,
+             dummy_cache_len, dummy_spk_targets, dummy_bg_spk_targets),
+            raw_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+        )
+        print("  Consolidating encoder weights into single .data file...")
+        model_proto = onnx.load(raw_path)
+        if os.path.exists(data_file):
+            os.remove(data_file)
+        onnx_export.save(model_proto, output_path, "encoder.onnx.data")
 
-    model_proto = onnx.load(output_path)
-    input_names_exported = [inp.name for inp in model_proto.graph.input]
+    saved = onnx.load(output_path, load_external_data=False)
+    input_names_exported = [inp.name for inp in saved.graph.input]
     if "spk_targets" not in input_names_exported:
         print("  WARNING: spk_targets was still constant-folded out!")
     else:
         print("  spk_targets confirmed as ONNX graph input")
 
-    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"  encoder.onnx: {size_mb:.1f}MB")
+    print(f"  encoder.onnx: {os.path.getsize(output_path) / (1024*1024):.1f}MB"
+          f" + {os.path.getsize(data_file) / (1024*1024):.1f}MB data")
 
 
 @torch.no_grad()

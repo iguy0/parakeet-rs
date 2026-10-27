@@ -26,6 +26,8 @@ print(f"PyTorch version: {torch.__version__}")
 print(f"loading model from: {args.input_path}")
 model = SortformerEncLabelModel.restore_from(restore_path=args.input_path, map_location='cpu')
 model.eval()
+onnx_export.use_sdpa(model)
+onnx_export.exact_position_slices(model)
 
 FEAT_DIM = 128
 EMB_DIM = 512

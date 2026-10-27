@@ -111,6 +111,8 @@ def export_model(args: argparse.Namespace) -> Path:
         strict=args.strict,
     )
     model.eval()
+    onnx_export.use_sdpa(model)
+    onnx_export.exact_position_slices(model)
 
     sm = model.sortformer_modules
     sm.chunk_len = args.chunk_len

@@ -60,8 +60,8 @@ except Exception as e:
     print(f"Tokenizer extraction failed: {e}")
 
 print("Exporting Decoder and Joint modules...")
-# Standard export works fine for the Decoder/Joint as they are largely
-# independent of the streaming state logic.
+# onnx_export.export_decoder_joint writes one RNNT prediction step, using
+# NeMo's example inputs, names, and dynamic axes, then folds constants.
 onnx_export.export_decoder_joint(model, os.path.join(o_d, "decoder_joint.onnx"))
 
 # Export Stateful Encoder 
