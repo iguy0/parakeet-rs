@@ -185,31 +185,36 @@ See `examples/ark_asr.rs` for a runnable demo.
 
 ## Setup
 
-**CTC**: Download from [HuggingFace](https://huggingface.co/onnx-community/parakeet-ctc-0.6b-ONNX/tree/main/onnx): `model.onnx`, `model.onnx_data`, `tokenizer.json`
+Weights are downloaded separately. Put every file for one model in the same directory. Each row's first link is the ONNX bundle; the second is the source checkpoint when it lives in another repo.
 
-**CTC (Granite TurboCTC)**: Third-party CTC-family model, supported via metadata-driven `CtcConfig`. Download the [community ONNX export](https://huggingface.co/qwertz92/granite-speech-5.0-470m-turboctc-onnx), then stamp the CTC metadata once with `python scripts/patch_ctc_onnx_metadata.py --input onnx/model.onnx --in-place --preset granite-turbo-ctc` and load it like any other CTC model with `Parakeet::from_pretrained`.
+| Model | ONNX | Source |
+|---|---|---|
+| CTC 0.6B | [onnx-community/parakeet-ctc-0.6b-ONNX](https://huggingface.co/onnx-community/parakeet-ctc-0.6b-ONNX) | [nvidia/parakeet-ctc-0.6b](https://huggingface.co/nvidia/parakeet-ctc-0.6b) |
+| Granite Speech 5.0 470M TurboCTC | [qwertz92/granite-speech-5.0-470m-turboctc-onnx](https://huggingface.co/qwertz92/granite-speech-5.0-470m-turboctc-onnx) | [ibm-granite/granite-speech-5.0-470m-turboctc](https://huggingface.co/ibm-granite/granite-speech-5.0-470m-turboctc) |
+| TDT 0.6B v3 (fp32 and INT8) | [istupakov/parakeet-tdt-0.6b-v3-onnx](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx) | [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) |
+| Fluid Speech Pro (TDT, verbatim and clean INT8) | [FluidVoice-Labs/fluid-speech-pro-onnx](https://huggingface.co/FluidVoice-Labs/fluid-speech-pro-onnx) | [FluidVoice-Labs/fluid-speech-pro](https://huggingface.co/FluidVoice-Labs/fluid-speech-pro) |
+| EOU 120M v1 | [altunenes/parakeet-rs `realtime_eou_120m-v1-onnx`](https://huggingface.co/altunenes/parakeet-rs/tree/main/realtime_eou_120m-v1-onnx) | [nvidia/parakeet_realtime_eou_120m-v1](https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1) |
+| Nemotron EN 0.6B fp32 | [altunenes/parakeet-rs `nemotron-speech-streaming-en-0.6b`](https://huggingface.co/altunenes/parakeet-rs/tree/main/nemotron-speech-streaming-en-0.6b) | [nvidia/nemotron-speech-streaming-en-0.6b](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b) |
+| Nemotron EN 0.6B INT8, 560 ms | [investguy/nemotron-speech-streaming-en-0.6b-int8](https://huggingface.co/investguy/nemotron-speech-streaming-en-0.6b-int8) | same NVIDIA checkpoint |
+| Nemotron EN 0.6B INT8 / INT4 | [lokkju INT8](https://huggingface.co/lokkju/nemotron-speech-streaming-en-0.6b-int8), [lokkju INT4](https://huggingface.co/lokkju/nemotron-speech-streaming-en-0.6b-int4) | same NVIDIA checkpoint |
+| Nemotron 3.5 multilingual 0.6B | [altunenes/parakeet-rs `nemotron-3.5-asr-streaming-0.6b-onnx`](https://huggingface.co/altunenes/parakeet-rs/tree/main/nemotron-3.5-asr-streaming-0.6b-onnx) | [nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) |
+| Unified EN 0.6B | [bobNight/parakeet-unified-en-0.6b-onnx](https://huggingface.co/bobNight/parakeet-unified-en-0.6b-onnx) | [nvidia/parakeet-unified-en-0.6b](https://huggingface.co/nvidia/parakeet-unified-en-0.6b) |
+| Multitalker 0.6B v1 | [smcleod INT8](https://huggingface.co/smcleod/multitalker-parakeet-streaming-0.6b-v1-onnx-int8) | [nvidia/multitalker-parakeet-streaming-0.6b-v1](https://huggingface.co/nvidia/multitalker-parakeet-streaming-0.6b-v1) |
+| Cohere Transcribe 03-2026 | [onnx-community/cohere-transcribe-03-2026-ONNX](https://huggingface.co/onnx-community/cohere-transcribe-03-2026-ONNX) | [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) |
+| Sortformer 4spk v2 and v2.1 | [v2](https://huggingface.co/altunenes/parakeet-rs/blob/main/diar_streaming_sortformer_4spk-v2.onnx), [v2.1](https://huggingface.co/altunenes/parakeet-rs/blob/main/diar_streaming_sortformer_4spk-v2.1.onnx) | [v2](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2), [v2.1](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2.1) |
+| Sortformer Ultra 8spk v1 | [investguy/ultra_diar_streaming_sortformer_8spk_v1_onnx](https://huggingface.co/investguy/ultra_diar_streaming_sortformer_8spk_v1_onnx) | [devsy0117/ultra_diar_streaming_sortformer_8spk_v1](https://huggingface.co/devsy0117/ultra_diar_streaming_sortformer_8spk_v1) |
+| Nemotron-3 Diarization (offline, low, verylow, ultralow) | [investguy/nemotron3-diarization-onnx](https://huggingface.co/investguy/nemotron3-diarization-onnx) | [nvidia/Nemotron-3-Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization) |
+| Ark ASR 0.6B INT8 | [Audio8/ark-asr-0.6b-int8-onnx](https://huggingface.co/Audio8/ark-asr-0.6b-int8-onnx) | same repo |
+| oruk-fourier-2b INT4 | [investguy/oruk-fourier-2b-int4-onnx](https://huggingface.co/investguy/oruk-fourier-2b-int4-onnx) | [oruk/oruk-fourier-2b](https://huggingface.co/oruk/oruk-fourier-2b) |
+| oruk-fourier-2b mixed INT4/INT8 | [investguy/oruk-fourier-2b-int4-mixed-onnx](https://huggingface.co/investguy/oruk-fourier-2b-int4-mixed-onnx) | [oruk/oruk-fourier-2b](https://huggingface.co/oruk/oruk-fourier-2b) |
 
-**TDT**: Download from [HuggingFace](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx): `encoder-model.onnx`, `encoder-model.onnx.data`, `decoder_joint-model.onnx`, `vocab.txt`
+Granite TurboCTC needs one metadata stamp before `Parakeet::from_pretrained`: `python scripts/patch_ctc_onnx_metadata.py --input onnx/model.onnx --in-place --preset granite-turbo-ctc`.
 
-**EOU**: Download from [HuggingFace](https://huggingface.co/altunenes/parakeet-rs/tree/main/realtime_eou_120m-v1-onnx): `encoder.onnx`, `decoder_joint.onnx`, `tokenizer.json`
+Fluid Speech Pro loads through the TDT API. Clean mode is the `*.clean.int8.onnx` graphs in that repo, renamed to `encoder-model.int8.onnx` and `decoder_joint-model.int8.onnx`. The license is CC BY 4.0.
 
-**Nemotron (English-only)**: Download from [HuggingFace](https://huggingface.co/altunenes/parakeet-rs/tree/main/nemotron-speech-streaming-en-0.6b): `encoder.onnx`, `encoder.onnx.data`, `decoder_joint.onnx`, `tokenizer.model` (*[int8](https://huggingface.co/lokkju/nemotron-speech-streaming-en-0.6b-int8) / [int4](https://huggingface.co/lokkju/nemotron-speech-streaming-en-0.6b-int4)*)
+Nemotron English INT8 above is the 560 ms export (`--right-context 6`). The 80 ms, 160 ms, and 1120 ms graphs are not published. Multitalker also needs a Sortformer ONNX for diarization. Nemotron-3 diarization files are one latency preset each; start post-processing from `DiarizationConfig::nemotron3()`.
 
-**Nemotron (Multilingual 3.5)**: Download from [HuggingFace](https://huggingface.co/altunenes/parakeet-rs/tree/main/nemotron-3.5-asr-streaming-0.6b-onnx): `encoder.onnx`, `encoder.onnx.data`, `decoder_joint.onnx`, `tokenizer.model`. Or export it yourself from the [base model](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) with `scripts/export_nemotron_streaming_multilingual.py`.
-
-**Unified**: Download from [HuggingFace](https://huggingface.co/bobNight/parakeet-unified-en-0.6b-onnx): `encoder.onnx`, `encoder.onnx.data`, `decoder_joint.onnx`, `tokenizer.model`
-
-**Multitalker**: Download from [HuggingFace](https://huggingface.co/smcleod/multitalker-parakeet-streaming-0.6b-v1-onnx-int8/tree/main): `encoder.int8.onnx`, `decoder_joint.int8.onnx`, `tokenizer.model` (also needs a Sortformer model for diarization)
-
-**Cohere Transcribe**: Download from [HuggingFace](https://huggingface.co/onnx-community/cohere-transcribe-03-2026-ONNX): `encoder_model.onnx` (+ `.onnx_data*`), `decoder_model_merged.onnx` (+ `.onnx_data`), `tokenizer.json` (FP32, FP16, INT8, INT4 variants available)
-
-**Diarization (Sortformer v2 & v2.1)**: Download from [HuggingFace](https://huggingface.co/altunenes/parakeet-rs/tree/main): `diar_streaming_sortformer_4spk-v2.onnx` or `v2.1.onnx`.
-
-**Diarization (Sortformer Ultra, 8 speakers)**: Export with `scripts/export_ultra_diar_8spk.py`; the resulting ONNX carries `num_speakers=8` metadata and loads via the same `Sortformer::with_config` API.
-
-**Ark ASR**: Download the INT8 ONNX package from [HuggingFace](https://huggingface.co/Audio8/ark-asr-0.6b-int8-onnx): `runtime_manifest.json`, `audio_encoder_whisper_int8.onnx`, `audio_encoder_adapter_int8.onnx`, `embedding_fp32.onnx` (+ `.data`), `llm_kv_cpu_fp32_int8.onnx`, `tokenizer.json`, `preprocessor_config.json`
-
-Quantized versions available (int8). All files must be in the same directory.
+The oruk-fourier-2b bundles are ONNX only. This crate has no loader for them yet. The source model is CC BY-NC 4.0 (its base is [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)); commercial and hosted use need Oruk's licence. ONNX Runtime 1.20 or newer is required (`GatherBlockQuantized`).
 
 GPU support (auto-falls back to CPU if fails):
 ```toml
@@ -231,17 +236,15 @@ let config = ExecutionConfig::new()
 
 ## Features
 
-- [CTC: English with punctuation & capitalization](https://huggingface.co/nvidia/parakeet-ctc-0.6b)
-- [TDT: Multilingual (auto lang detection)](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
-- [EOU: Streaming ASR with end-of-utterance detection](https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1)
-- [Nemotron: Cache aware streaming ASR (600M params,EN only)](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b)
-- [Unified: Offline + buffered streaming RNNT ASR (600M params, EN only)](https://huggingface.co/nvidia/parakeet-unified-en-0.6b)
-- [Multitalker: Streaming multi-speaker ASR with speaker-kernel injection](https://huggingface.co/nvidia/multitalker-parakeet-streaming-0.6b-v1) ([ONNX int8](https://huggingface.co/smcleod/multitalker-parakeet-streaming-0.6b-v1-onnx-int8))
-- [Cohere Transcribe: Offline multilingual ASR (14 languages, long-form supported)](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) ([ONNX](https://huggingface.co/onnx-community/cohere-transcribe-03-2026-ONNX))
-- [Sortformer v2 & v2.1: Streaming speaker diarization (up to 4 speakers)](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2) NOTE: you can also download v2.1 model same way.
-- Sortformer Ultra: 8-speaker diarization export (`scripts/export_ultra_diar_8spk.py`)
-- [Ark ASR: Offline speech-LLM ASR (Whisper encoder + Qwen2 LM, greedy)](https://huggingface.co/Audio8/ark-asr-0.6b-int8-onnx)
-- Granite TurboCTC: third-party CTC-family model support via metadata-driven `CtcConfig` (`scripts/patch_ctc_onnx_metadata.py`)
+Download links for every model are in the table above.
+
+- CTC, Granite TurboCTC, TDT, and Fluid Speech Pro: offline ASR. TDT and Fluid Speech Pro cover 25 languages with automatic language detection
+- EOU, Nemotron (English and multilingual 3.5), and Multitalker: streaming ASR
+- Unified: offline and buffered streaming RNNT
+- Cohere Transcribe: offline multilingual ASR, 14 languages, long-form supported
+- Sortformer v2, v2.1, Ultra 8-speaker, and Nemotron-3 Diarization: speaker diarization
+- Ark ASR: offline speech-LLM (Whisper encoder and Qwen2 LM, greedy)
+- oruk-fourier-2b INT4 and mixed INT4/INT8: ONNX bundles only, no Rust loader in this crate yet
 - Token-level timestamps (CTC, TDT)
 
 ## Notes
@@ -253,4 +256,4 @@ let config = ExecutionConfig::new()
 
 Code: MIT OR Apache-2.0
 
-FYI: The Parakeet ONNX models (downloaded separately from HuggingFace) by NVIDIA. This library does not distribute the models.
+Model weights are not in this repository. Each download keeps the license of its source model, linked in the table above.
