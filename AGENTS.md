@@ -103,7 +103,7 @@ git push-fork        # push current branch to origin (iguy0)
 
 | Layer | Technology |
 |-------|------------|
-| Language | Rust 2024 (`parakeet-rs` v0.3.7) |
+| Language | Rust 2024 (`parakeet-rs` v0.3.8) |
 | Inference | [ort](https://docs.rs/ort) 2.0.0-rc.15 (ONNX Runtime bindings; needs a process-wide `Environment`, see `execution.rs`) |
 | Arrays | `ndarray` 0.17 |
 | Tokenizers | `tokenizers` 0.23 (CTC/EOU/Cohere), custom SentencePiece (Nemotron/TDT/Unified) |
