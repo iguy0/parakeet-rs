@@ -68,6 +68,7 @@ git push-fork        # push current branch to origin (iguy0)
 | `scripts/export_nemotron_streaming.py` | Modified | Export/latency documentation and `--right-context` presets |
 | `src/nemotron.rs` | Modified | 560 ms chunk config comment + beam decoding hook; `flush` / `flush_with_tokens` finish the streaming tail (offline last-chunk pad); `#[doc(hidden)] stage_timing_ns` |
 | `scripts/quantize_nemotron_streaming.py` | Added | INT8/INT4 quantization tooling (candidate for upstream) |
+| `scripts/quantize_qwen3_asr_int4.py` | Added | Weight-only INT4 (`--recipe int4`) and mixed INT4/INT8 (`--recipe mixed`) quantization of sherpa-onnx style Qwen3-ASR bundles (`conv_frontend`/`encoder`/`decoder`, e.g. `oruk/oruk-fourier-2b`, Qwen3-ASR-0.6B/1.7B). ONNX only: there is no Rust loader for this family yet. Results in section 4 Testing |
 | `scripts/export_ultra_diar_8spk.py` | Added | 8-speaker Sortformer export |
 | `scripts/export_nemotron3_diarization.py` | Added | `nvidia/Nemotron-3-Diarization` export (31-layer RoPE transformer, 8 spk, 99.2M params). Same 6-in/3-out ONNX contract as the other Sortformer exports; presets `offline`/`low`/`verylow`/`ultralow`; swaps NeMo FlexAttention for dense-mask SDPA at export time; stamps cache-compression metadata; optional `--int8-output` + `--compare-wav` |
 | `src/sortformer.rs` (metadata) | Modified | `num_speakers` (default 4), plus optional `spkcache_sil_frames_per_spk` (default 3), `scores_boost_latest` (default 0), `sil_emb` (fixed silence embedding replacing the running mean). Absent keys keep legacy behaviour |
@@ -82,9 +83,16 @@ git push-fork        # push current branch to origin (iguy0)
 | `src/ark_asr.rs`, `src/model_ark.rs` | Added | `ArkAsr` speech-LLM transcriber *(feature `ark-asr`)* — Whisper-style audio encoder + adapter + Qwen2 causal LM with static KV cache, for `Audio8/ark-asr-0.6b-int8-onnx`. `ArkLongAudioPolicy` (default `Truncate`) + `transcribe_long`; audio-token count taken from the encoder output; optional `set_repeat_guard` (default off) |
 | `src/cohere.rs`, `src/model_cohere.rs`, `src/audio.rs` | Modified | `transcribe_audio_long` + `set_max_chunk_secs` (default 35 s, quiet-point split shared with Ark via `audio::split_at_quiet_point`). Decoder reuses encoder K/V after the first step; layer/head/head-dim come from the decoder graph. Optional steady decoder: `set_use_steady_decoder` (default on when `decoder_model_steady.onnx` or `decoder_model_steady_quantized.onnx` sits next to the merged decoder, flat or under `onnx/`); absent file keeps the merged graph for every step |
 | `scripts/export_cohere_steady_decoder.py` | Added | Derives a steady-state Cohere decoder from the Optimum merged graph (no first-step `If`, no `encoder_hidden_states`, no `present.*.encoder.*`). Stamps `cohere_decoder_variant=steady`. External weights stay at their original offsets; the data file is hardlinked beside the output, or copied if the filesystem rejects the link |
+| `src/parakeet_tdt.rs` (sidecar defaults) | Modified | Optional `parakeet_rs` object in the model dir's `config.json`: `decoding` (`greedy`/`beam`, only for constructors without an explicit strategy) and `max_chunk_secs` (long audio is split at quiet points, joined, timestamps shifted; `max_chunk_secs()` / `set_max_chunk_secs()`). Absent keys keep legacy behavior (greedy, one call per clip). Local Fluid Speech Pro and v3 INT8 dirs are stamped `greedy` + `120` |
+| `tests/common/mod.rs` (`tdt_available`) | Modified | Accepts `encoder-model.int8.onnx` / `decoder_joint-model.int8.onnx` as well as the fp32 names, so INT8-only TDT dirs (e.g. Fluid Speech Pro) are not skipped. `src/model_tdt.rs` already loaded the INT8 names |
+| `tests/model_benchmark.rs` (`asr_knob_sweep`) | Modified | Ignored per-model knob sweep (Granite, Nemotron, Cohere, Ark, Multitalker); results and recommendations in section 4 Testing |
 | `tests/auto_traits.rs` | Added | Compile-time `Send`/`Sync` assertion for `Sortformer` (gated on feature `sortformer`) |
 | `plans/WEBGPU_IMPLEMENTATION_PLAN.md` | Added | WebGPU EP validation plan/progress (Linux Vulkan dev, Windows D3D12 path, Nemotron-only correctness policy) |
 | `plans/ASR_PERFORMANCE_IMPLEMENTATION_PLAN.md` | Added | Phased ASR throughput/correctness plan (Ark, Cohere, Nemotron flush, Granite, Multitalker, Cohere steady decoder) with baselines and thread sweep |
+| `plans/2026-10-26-upstream-fixes-dynamo-exports.md` | Added | Completed plan (commits `6fabc14`..`69d66c1`): upstream fixes, `tokenizers` bump, dynamo export migration. Records constraints, e.g. do not replace this fork's Sortformer export scripts with upstream's (`preds_diar`/`preds_hires` outputs break the 6-in/3-out contract) |
+| `src/timestamps.rs` | Modified | Word/sentence grouping no longer dedups repeated words case-insensitively (a real second "the" was dropped) |
+| `src/sortformer.rs` (mel input) | Modified | Mel features are forced into standard (row-major) layout before ORT; a transposed `to_owned` stays column-major and ORT rejects it on full-size chunks |
+| `Cargo.toml` | Modified | `tokenizers` 0.23.2; `api-29`..`api-31` ORT features added (default stays `api-28`); `ort` stays non-optional |
 | `AGENTS.md` | Added | This file |
 
 ---
@@ -121,7 +129,7 @@ There is no server, database, or UI. Entry points are:
 - **Examples** — `examples/*.rs` (CLI demos)
 - **Export scripts** — offline Python pipelines producing ONNX artifacts
 
-Optional Cargo features gate heavier modules: `sortformer`, `multitalker` (implies `sortformer`), `cohere`, and hardware EPs (`cuda`, `tensorrt`, `webgpu`, etc.).
+Optional Cargo features gate heavier modules: `sortformer`, `multitalker` (implies `sortformer`), `cohere`, `ark-asr`, hardware EPs (`cuda`, `tensorrt`, `webgpu`, etc.), and ORT API level (`api-24`..`api-31`, default `api-28`).
 
 ---
 
@@ -205,6 +213,7 @@ Post-processing: `DiarizationConfig` presets (`callhome()`, `dihard3()`, `ultra_
 | `scripts/export_nemotron_streaming.py` | Nemotron EN ONNX export; `--right-context` sets latency. Graphs are exported with `scripts/onnx_export.py` | `nemotron.rs` `CHUNK_SIZE`, `PRE_ENCODE_CACHE` |
 | `scripts/export_nemotron_streaming_multilingual.py` | Multilingual 3.5 export. Graphs are exported with `scripts/onnx_export.py` | Same `Nemotron` API, auto-detects mode |
 | `scripts/quantize_nemotron_streaming.py` | Local INT8/INT4 quantization *(fork-only)* | Load quantized ONNX like any other model dir |
+| `scripts/quantize_qwen3_asr_int4.py` | INT4 / mixed INT4+INT8 `MatMulNBits` + `GatherBlockQuantized` for Qwen3-ASR sherpa-onnx bundles. FP32 source comes from the pinned sherpa-onnx exporter (`Wasser1462/Qwen3-ASR-onnx` at `0829a577`; oruk's `prepare_onnx_input.py` adapts the checkpoint) | None yet (validated with a Python ONNX Runtime harness) |
 | `scripts/export_realtime_eou_120m.py` | EOU model export | `parakeet_eou.rs` constants |
 | `scripts/export_parakeet_unified.py` | Unified RNNT export | `parakeet_unified.rs` |
 | `scripts/export_multitalker.py` | Multitalker encoder/decoder export. Graphs are exported with `scripts/onnx_export.py` | `multitalker.rs` |
@@ -297,6 +306,7 @@ flowchart LR
 | **`nemotron3()` preset** | Tuned on two clips only (about 0.7 DER points over `callhome()`); `callhome()` remains a sound default. Nemotron-3's higher missed-speech rate on many-speaker audio is not a threshold problem |
 | **Nemotron-3 INT8 on CUDA** | The CUDA EP needs cuDNN on `LD_LIBRARY_PATH` (e.g. the conda env's `nvidia/cudnn/lib`), and dynamic-INT8 ops fall back to CPU, so the GPU gave only about 1.3x vs 1.0x on the 0.32 s preset. fp32 on CUDA is untested |
 | **Low-latency CPU cost** | Each step reprocesses `spkcache + fifo + chunk` (about 530 frames); INT8 on CPU runs about 1.0x real time at 1.04 s, 0.7x at 0.64 s, 0.4x at 0.32 s |
+| **Qwen3-ASR INT4 bundles** | `oruk/oruk-fourier-2b` is CC BY-NC 4.0 (commercial and hosted use need Oruk's licence), so keep its weights and derived bundles local and out of README/benchmark manifests; the Apache-2.0 Qwen3-ASR-1.7B uses the same graphs and script. The sherpa export declares the default opset twice (`""` and `ai.onnx`) at opset 17, and ORT's own quantizer only relabels it as 21 (invalid for e.g. `ReduceMean`), so the script runs `onnx.version_converter` on a structure-only copy first. ONNX refuses symlinked external data. The decoder cache length is a symbolic dim (`max_total_len`), not baked in. Use RTN: HQQ writes zero points and ran about 15x slower on CPU (0.3 vs 5 tok/s). `GatherBlockQuantized` needs ORT >= 1.20. Layer 0 nodes have no numeric suffix (`/v_proj/MatMul`), so `--int8-regex` patterns need `(_\d+)?`. HQQ on a GPU that another process holds fails with CUDA OOM: set `CUDA_VISIBLE_DEVICES=""` |
 | **Stray files** | `scripts/test_write.txt` (scratch, contains `ok`) and `scripts/__pycache__/` are not part of the project and must not be committed |
 | **`ModelConfig::configure` closures** | Must be `Send + Sync + 'static` (wrapped in `Arc`) now that `ModelConfig` itself is `Send + Sync` — custom `SessionBuilder` closures capturing non-`Sync` state will fail to compile |
 
@@ -316,6 +326,18 @@ flowchart LR
 - **Diarization benchmark knobs** (all optional, defaults unchanged): `PARAKEET_SORTFORMER_ONNX` (model path; default 4spk v2.1), `PARAKEET_DIAR_PRESET` (`callhome` | `dihard3` | `ultra8` | `nemotron3`), `PARAKEET_BENCH_SAMPLES` (comma list of `samples/` names, e.g. `smoke,committee`), `PARAKEET_STREAM_ROUTES` (`feed`, `feed_raw`), `PARAKEET_BENCH_LABEL` (tag in the CSV), `PARAKEET_EP` (`cpu`, or `cuda` when built with feature `cuda`).
 - **Diarization tests:** `diarization_benchmark_report` (offline DER, `samples/diarization_report.csv`); `sortformer_streaming_der_report` (1 s input increments through `feed`/`flush` and `feed_raw` + one `post_process`, `samples/diarization_streaming_report.csv`); `sortformer_streaming_smoke` (`diarize_chunk` + `flush`); `diarization_threshold_sweep` (`-- --ignored`, scores about 450 `DiarizationConfig`s on cached raw predictions, ranks by the clips in `PARAKEET_SWEEP_TUNE`). Unit tests in `src/sortformer.rs` check that `StreamPost` equals offline `post_process` for 1/3/9/340-frame steps and that its buffer stays bounded.
 - **WebGPU phase matrix:** `webgpu_phase_matrix` (`--ignored`, feature `webgpu`) times load, cold and warm smoke runs, and long clips (`PARAKEET_MATRIX_SAMPLES`, default `committee`) for `PARAKEET_MATRIX_MODELS` (default all of granite, cohere, ark, nemotron, multitalker, sortformer) under `PARAKEET_EP`, writing `samples/webgpu_matrix.csv`. Run one model per process. Results and conclusions are in `plans/WEBGPU_IMPLEMENTATION_PLAN.md` ("Expanded WebGPU matrix").
+- **Per-model knob sweep:** `asr_knob_sweep` (`-- --ignored`, features `sortformer multitalker cohere ark-asr`) scores named configs for one model over the selected samples and writes them to `samples/asr_report.csv` (config name in the `decoding` column, mode `knob`). Env: `PARAKEET_KNOB_MODEL` (`granite`, `nemotron`, `cohere`, `ark`, `multitalker`; one per process), optional `PARAKEET_KNOB_CONFIGS` (comma list), `PARAKEET_BENCH_ALL=1`, `PARAKEET_BENCH_SAMPLES`. Multitalker runs on `smoke` only (its per-speaker transcripts are not time ordered, so combined WER on meetings is meaningless). Never start two sweeps at once.
+- **ASR knob findings** (CPU, 4 threads, WER % smoke / committee / datascience, RTFx; baseline in bold):
+
+| Model | Knob | Result | Recommendation |
+|-------|------|--------|----------------|
+| Granite TurboCTC | `greedy` vs CTC beam 2/5/10/20, `frame_topk` | **greedy 3.7 / 9.9 / 11.1 at 18x**; every beam is equal or 0.1-0.2 worse and 15% (beam 5) to 55% (beam 20) slower | Keep greedy; beam has no benefit |
+| Nemotron EN streaming | greedy, beam 2/5/10, `length_penalty` 0/0.013/0.1, peak-normalize, streaming vs offline | **stream greedy 1.8 / 11.1 / 8.8 at 2.4x**; beam 2 is 0.6 worse, beam 5 is 1.0-1.5 worse and 2x slower, beam 10 below real time; offline greedy 1.8 / 10.5 / 8.9 (0.6 better on committee, same speed); no-normalize is within 0.2 | Keep greedy. Beam hurts on long meetings (the hypothesis carry across 560 ms chunks degrades), do not enable it for Nemotron |
+| Ark ASR | `set_max_audio_seconds` 30/20/15, `set_repeat_guard` | **win30 0.0 / 5.7 at 1.2x**; win 20 and 15 give 5.3 (0.4 better) at the same speed; the guard changes nothing on these clips | Use `transcribe_long` with `set_max_audio_seconds(20)`; the guard stays optional (no loops seen) |
+| Cohere Transcribe | `set_max_chunk_secs` 35/30/25/20, `itn`, punctuation, steady vs merged decoder | **chunk35 0.0 / 6.2 at 0.6x**; chunk 25 gives 5.8 (best), 20 gives 6.0, 30 equals 35; `itn` 6.1; punctuation off is worse (3.7 smoke, 7.1 committee); steady/merged decoder identical text and speed on CPU | Use `transcribe_audio_long` with `set_max_chunk_secs(25)`; keep punctuation on; `itn` only when numerals are wanted |
+| Multitalker (smoke only) | `LatencyMode`, `DiarStrategy` | **Normal + PerChunk 1.8 at 1.2x**; Normal + Buffered 0.0 at 3.4x; Low 3.7 (0.6x per chunk, 2.2x buffered at 5.6); VeryLow 9.3 at 0.2x; Ultra 27.8 at 0.1x | Use `Normal` + `Buffered` (best WER and 2.8x faster); lower latency modes trade accuracy and fall below real time on CPU |
+
+  Datascience (29 min) was run for Granite and Nemotron only. Ark and Cohere used `smoke` and `committee` (a datascience clip would take about 40 min per config at 0.6-1.2x). A duplicate sweep process ran for about 25 minutes by accident and was killed; its extra CSV rows have the same WER and similar RTFx (56 cores, 4 threads each). Compare against the TDT results above: Fluid Speech Pro clean mode (5.7 / 5.9) is the only config near Ark (5.7 / n.a.) and Cohere (6.2 / n.a.) on committee, and the references are edited text.
 - **Slow configs:** low-latency Sortformer presets run near or below real time on CPU; restrict clips with `PARAKEET_BENCH_SAMPLES` and never launch several benchmark processes at once (they contend for CPU and make RTF meaningless).
 - **Reference diarization results** (DER %, CPU, `samples/`: committee 6 spk, datascience 11 spk, smoke 2 spk; only 3 clips, not comparable with published numbers):
 
@@ -330,6 +352,16 @@ flowchart LR
 | Nemotron-3 INT8, `feed()` 0.32 s window, `nemotron3` | not run | not run | 12.7 |
 
   Nemotron-3 fp32 and INT8 agree within 0.2 points; the older 8spk model is better on the 11-speaker clip.
+- **Qwen3-ASR INT4 results** (`oruk/oruk-fourier-2b`, greedy, 20 s chunks cut at quiet points, CPU 4 threads, ORT 1.27, Broadwell AVX2 without VNNI; harness lives in `models/oruk-fourier-2b-work/`, not in the repo; WER % smoke / committee, RTFx on committee):
+
+| Bundle | Size | Smoke | Committee | RTFx | Committee transcript edits vs FP32 |
+|--------|------|-------|-----------|------|------------------------------------|
+| FP32 export | 9.4 GB | 0.0 | 6.43 | 0.73 (8 thr) | n.a. |
+| `--recipe int4` (all 4-bit, block 32) | 1.4 GB | 0.0 | 6.43 | 1.25 | 29 (1.68%) |
+| `--recipe mixed` (see below, block 16) | 2.0 GB | 0.0 | 6.66 | 0.94 | 10 (0.58%) |
+
+ `int4` keeps 4-bit everywhere except what has no 4-bit op (3 frontend Conv2d, norms, attention MatMuls). `mixed` puts the frontend `conv_out`, all 146 encoder MatMuls and the decoder `lm_head`, `v_proj` and `down_proj` (57 nodes) at 8 bit; q/k/o/gate/up and the token embedding stay 4-bit. WER differences of 0.2 points are about 4 words and are noise on committee (1721 words), so choose by fidelity: the transcript edit distance to FP32 is the better signal. `accuracy_level=4` is 30% faster than float compute on this CPU; decode stops scaling past 8 threads (graph KV plumbing dominates). `mixed` decodes about 25% slower (3.5 vs 4.6 tok/s).
+ Sensitivity study (12 committee chunks, teacher-forced KL against FP32 decoder logits, lower is better): all-4-bit decoder 0.052; `lm_head` 8-bit 0.051; `v_proj` 8-bit 0.042; `down_proj` 8-bit 0.036; attention q/k/v/o 8-bit 0.033; first/last two layers 8-bit 0.044; block 16 instead of 32 0.042; `v_proj`+`down_proj`+`lm_head` 8-bit 0.023 (block 32) and 0.017 (block 16); adding q/k/o 0.013. Encoder output cosine vs FP32: 4-bit 0.982 (relative error 19%), 8-bit 0.9995 (3%), so the audio encoder is where 4-bit hurts and the first thing to promote.
 - Validation is otherwise manual via `examples/` with downloaded ONNX weights (including `examples/ark_asr.rs`, feature `ark-asr`).
 
 ---
@@ -384,7 +416,7 @@ parakeet-rs/
 ├── tests/                  # model_benchmark.rs (weight-gated WER/DER) + common/mod.rs + auto_traits.rs
 ├── scripts/                # NeMo → ONNX export (+ local quantize, CTC metadata patch, Nemotron-3 diarization export)
 │   └── benchmark/          # run_all.sh, manifest.toml, compare_greedy_beam.py
-├── plans/                  # Design docs (BEAM_SEARCH_, WEBGPU_, ASR_PERFORMANCE_IMPLEMENTATION_PLAN.md)
+├── plans/                  # Design docs (BEAM_SEARCH_, WEBGPU_, ASR_PERFORMANCE_IMPLEMENTATION_PLAN.md, 2026-10-26-upstream-fixes-dynamo-exports.md)
 └── .github/workflows/rust.yml
 ```
 
@@ -393,7 +425,8 @@ parakeet-rs/
 | Variant | Required files |
 |---------|----------------|
 | CTC | `model.onnx`, `model.onnx_data`, `tokenizer.json` |
-| TDT | `encoder-model.onnx`, `decoder_joint-model.onnx`, `vocab.txt` |
+| TDT | `encoder-model.onnx`, `decoder_joint-model.onnx`, `vocab.txt` (or the `.int8.onnx` variants) |
+| Fluid Speech Pro (TDT) | Published INT8 ONNX from `FluidVoice-Labs/fluid-speech-pro-onnx`, loaded as TDT with no code changes (the extra `fv_insert` block is inside the encoder graph). Local dirs: `models/fluid-speech-pro-int8-onnx` (verbatim) and `models/fluid-speech-pro-clean-int8-onnx` (clean mode: symlinks that rename the `*.clean.int8.onnx` graphs to the standard names and share the verbatim `.onnx.data` files). Benchmark (CPU, 4 threads, WER %, committee / datascience / smoke): v3 INT8 greedy 15.7 / 12.6 / 3.7, beam 13.2 / 11.7 / 22.2; Fluid verbatim greedy 11.2 / 9.8 / 3.7, beam 10.4 / 9.5 / 3.7; Fluid clean greedy 5.7 / 5.9 / 0.0 (references are edited text). Fluid is about 25% slower (RTFx 5.5 vs 7.2 greedy); beam halves speed for 0.3-0.8 points, so greedy is the stamped default. Exporting from the `.nemo` file would need `fluid_speech.attach()` (strict load); `export_parakeet_tdt.py` does not do this and would silently drop `fv_insert` |
 | EOU | `encoder.onnx`, `decoder_joint.onnx`, `tokenizer.json` |
 | Nemotron | `encoder.onnx`, `encoder.onnx.data`, `decoder_joint.onnx`, `tokenizer.model` |
 | Unified | Same layout as Nemotron |

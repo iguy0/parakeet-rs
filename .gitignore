@@ -1,18 +1,26 @@
 # Rust build artifacts
 /target/
+**/*.rs.bk
 
-# OS / editor
+# OS / editor / local agent scratch
 .DS_Store
 *.DS_Store
+Thumbs.db
 .idea/
 .vscode/
+.cursor/
+.superpowers/
 *.swp
+*.swo
 *~
 *.log
 
 # Local environment
 .env
 .env.*
+.venv/
+venv/
+.direnv/
 
 # Model weights and exports (download or generate locally — see AGENTS.md)
 models/
@@ -22,18 +30,42 @@ models/
 *.onnx_data*
 *.onnx_data_*
 *.model
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.data
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
 out_onnx/
 out_onnx_int8/
+output/
+.quantize_work/
 
 # Legacy per-model dirs at repo root (if exported outside models/)
 nemotron-speech-streaming-en-0.6b/
 ultra_diar_streaming_sortformer_8spk_v1/
 ultra_diar_streaming_sortformer_8spk_v1_onnx/
 
-# Local benchmark audio, transcripts, and CSV reports (except smoke fixture below)
+# Local benchmark audio, transcripts, and CSV reports.
+# samples/smoke/ is the only fixture that belongs in git.
 samples/*
 !samples/smoke/
 !samples/smoke/**
+*.wav
+*.flac
+*.mp3
+*.ogg
+!samples/smoke/**/*.wav
+!samples/smoke/**/*.flac
+!samples/smoke/**/*.mp3
+!samples/smoke/**/*.ogg
+*_report.csv
+scripts/benchmark/results/
 
 # Nested parakeet-rs fork (separate git repo)
 parakeet-rs/
@@ -42,6 +74,10 @@ parakeet-rs/
 __pycache__/
 *.pyc
 .cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
 
 # Scratch / temp files
 scripts/test_write.txt

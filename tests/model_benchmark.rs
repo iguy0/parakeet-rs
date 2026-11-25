@@ -2666,3 +2666,273 @@ fn webgpu_phase_matrix() {
         }
     }
 }
+
+// --- Per-model knob sweep ----------------------------------------------------
+//
+// One ignored test that scores a list of named configurations ("knobs") for a single
+// model over the selected samples and records each as a row in samples/asr_report.csv
+// (the config name goes in the `decoding` column, mode is `knob`).
+//
+//   PARAKEET_KNOB_MODEL    granite | nemotron | cohere | ark | multitalker   (required)
+//   PARAKEET_KNOB_CONFIGS  optional comma list of config names to run (resume / subset)
+//   PARAKEET_BENCH_ALL=1   include the long clips; PARAKEET_BENCH_SAMPLES narrows them
+//
+// Run one model per process; configs run sequentially so RTFx is comparable.
+
+fn knob_wanted(name: &str) -> bool {
+    match std::env::var("PARAKEET_KNOB_CONFIGS") {
+        Ok(v) if !v.trim().is_empty() => v.split(',').any(|c| c.trim() == name),
+        _ => true,
+    }
+}
+
+/// Run one named configuration over the selected clips and record WER/CER/RTFx.
+/// `run` returns `Ok((hypothesis, seconds))` or an error string (logged, row skipped).
+fn knob_run(
+    model: &str,
+    config: &str,
+    smoke_only: bool,
+    mut run: impl FnMut(&[f32]) -> Result<(String, f32), String>,
+) {
+    if !knob_wanted(config) {
+        return;
+    }
+    eprintln!("\n[knob] {model} / {config}:");
+    for sample in selected_asr_samples() {
+        if smoke_only && sample.name != "smoke" {
+            continue;
+        }
+        let (audio, _) = load_wav_mono_16k(&sample.wav);
+        let audio_secs = audio.len() as f32 / 16_000.0;
+        match run(&audio) {
+            Ok((hyp, secs)) => {
+                record_asr(
+                    &sample.name,
+                    model,
+                    "knob",
+                    config,
+                    &requested_ep(),
+                    audio_secs,
+                    secs,
+                    &reference_for(&sample),
+                    &hyp,
+                );
+            }
+            Err(e) => eprintln!("  {:<26} FAILED: {e}", sample.name),
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn asr_knob_sweep() {
+    let which = std::env::var("PARAKEET_KNOB_MODEL").unwrap_or_default();
+    if ep_skip_if_unavailable("asr_knob_sweep") {
+        return;
+    }
+    match which.as_str() {
+        "granite" => knob_granite(),
+        "nemotron" => knob_nemotron(),
+        #[cfg(feature = "cohere")]
+        "cohere" => knob_cohere(),
+        #[cfg(feature = "ark-asr")]
+        "ark" => knob_ark(),
+        #[cfg(feature = "multitalker")]
+        "multitalker" => knob_multitalker(),
+        other => skip(
+            "asr_knob_sweep",
+            &format!("set PARAKEET_KNOB_MODEL (got '{other}'); cohere/ark/multitalker need their feature"),
+        ),
+    }
+}
+
+fn knob_granite() {
+    use parakeet_rs::Parakeet;
+    if !granite_available() {
+        return skip("knob_granite", "model missing");
+    }
+    let beam = |size: usize, topk: usize| {
+        let mut b = BeamConfig::default_ctc();
+        b.beam_size = size;
+        b.frame_topk = topk;
+        DecodingStrategy::Beam(b)
+    };
+    let configs: Vec<(&str, DecodingStrategy)> = vec![
+        ("greedy", DecodingStrategy::Greedy),
+        ("beam2", beam(2, 0)),
+        ("beam5", beam(5, 0)),
+        ("beam10", beam(10, 0)),
+        ("beam20", beam(20, 0)),
+        ("beam10_topk3", beam(10, 3)),
+    ];
+    for (name, decoding) in configs {
+        knob_run("granite-turboctc-int8", name, false, |audio| {
+            let mut m = Parakeet::from_pretrained_with_decoding(
+                granite_dir(),
+                Some(execution_config()),
+                decoding,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(offline_transcribe(&mut m, audio))
+        });
+    }
+}
+
+fn knob_nemotron() {
+    use parakeet_rs::Nemotron;
+    if !nemotron_available() {
+        return skip("knob_nemotron", "model missing");
+    }
+    let beam = |size: usize, lp: f32, sym: usize| {
+        let mut b = BeamConfig::default_unified();
+        b.beam_size = size;
+        b.length_penalty = lp;
+        b.max_symbols_per_step = sym;
+        DecodingStrategy::Beam(b)
+    };
+    // (name, decoding, streaming?, peak-normalize?)
+    let configs: Vec<(&str, DecodingStrategy, bool, bool)> = vec![
+        ("stream_greedy", DecodingStrategy::Greedy, true, true),
+        ("stream_greedy_nonorm", DecodingStrategy::Greedy, true, false),
+        ("stream_beam2", beam(2, 0.013, 10), true, true),
+        ("stream_beam5", beam(5, 0.013, 10), true, true),
+        ("stream_beam10", beam(10, 0.013, 10), true, true),
+        ("stream_beam5_lp0", beam(5, 0.0, 10), true, true),
+        ("stream_beam5_lp0.1", beam(5, 0.1, 10), true, true),
+        ("offline_greedy", DecodingStrategy::Greedy, false, true),
+        ("offline_beam5", beam(5, 0.013, 10), false, true),
+    ];
+    for (name, decoding, streaming, norm) in configs {
+        knob_run("nemotron-en-0.6b-int8", name, false, |audio| {
+            let mut m = Nemotron::from_pretrained_with_decoding(
+                nemotron_dir(),
+                Some(execution_config()),
+                decoding,
+            )
+            .map_err(|e| e.to_string())?;
+            let mut buf = audio.to_vec();
+            if norm {
+                peak_normalize(&mut buf);
+            }
+            let t0 = Instant::now();
+            let text = if streaming {
+                nemotron_transcribe(&mut m, &buf)
+            } else {
+                m.transcribe_audio(&buf).map_err(|e| e.to_string())?
+            };
+            Ok((text, t0.elapsed().as_secs_f32()))
+        });
+    }
+}
+
+#[cfg(feature = "cohere")]
+fn knob_cohere() {
+    use parakeet_rs::CohereASR;
+    if !cohere_available() {
+        return skip("knob_cohere", "model missing");
+    }
+    // (name, chunk secs, punctuation, itn, steady decoder)
+    let configs: [(&str, f32, bool, bool, bool); 7] = [
+        ("chunk35", 35.0, true, false, true),
+        ("chunk30", 30.0, true, false, true),
+        ("chunk25", 25.0, true, false, true),
+        ("chunk20", 20.0, true, false, true),
+        ("chunk35_itn", 35.0, true, true, true),
+        ("chunk35_nopunct", 35.0, false, false, true),
+        ("chunk35_merged_decoder", 35.0, true, false, false),
+    ];
+    for (name, chunk, punct, itn, steady) in configs {
+        knob_run("cohere-transcribe-int8", name, false, |audio| {
+            let mut m = CohereASR::from_pretrained(cohere_dir(), Some(execution_config()))
+                .map_err(|e| e.to_string())?;
+            m.set_max_chunk_secs(chunk);
+            m.set_use_steady_decoder(steady);
+            let t0 = Instant::now();
+            let text = m
+                .transcribe_audio_long(audio, "en", punct, itn)
+                .map_err(|e| e.to_string())?;
+            Ok((text, t0.elapsed().as_secs_f32()))
+        });
+    }
+}
+
+#[cfg(feature = "ark-asr")]
+fn knob_ark() {
+    use parakeet_rs::ArkAsr;
+    if !ark_available() {
+        return skip("knob_ark", "model missing");
+    }
+    // (name, window secs, repeat guard)
+    let configs: [(&str, u32, bool); 5] = [
+        ("win30", 30, false),
+        ("win30_guard", 30, true),
+        ("win20", 20, false),
+        ("win15", 15, false),
+        ("win20_guard", 20, true),
+    ];
+    for (name, win, guard) in configs {
+        knob_run("ark-asr-0.6b-int8", name, false, |audio| {
+            let mut m = ArkAsr::from_pretrained(ark_dir(), Some(execution_config()))
+                .map_err(|e| e.to_string())?;
+            m.set_max_audio_seconds(win);
+            m.set_repeat_guard(guard);
+            let t0 = Instant::now();
+            let text = m.transcribe_long(audio).map_err(|e| e.to_string())?;
+            Ok((text, t0.elapsed().as_secs_f32()))
+        });
+    }
+}
+
+/// Multitalker joins per-speaker transcripts (not time ordered), so the combined WER is only
+/// meaningful on the single-pass smoke clip; long meetings are skipped.
+#[cfg(feature = "multitalker")]
+fn knob_multitalker() {
+    use parakeet_rs::MultitalkerASR;
+    use parakeet_rs::multitalker::{DiarStrategy, LatencyMode};
+    if !multitalker_available() || !sortformer_available() {
+        return skip("knob_multitalker", "model or sortformer missing");
+    }
+    let configs: [(&str, LatencyMode, DiarStrategy); 6] = [
+        ("normal_perchunk", LatencyMode::Normal, DiarStrategy::PerChunk),
+        ("normal_buffered", LatencyMode::Normal, DiarStrategy::Buffered),
+        ("low_perchunk", LatencyMode::Low, DiarStrategy::PerChunk),
+        ("low_buffered", LatencyMode::Low, DiarStrategy::Buffered),
+        ("verylow_perchunk", LatencyMode::VeryLow, DiarStrategy::PerChunk),
+        ("ultra_perchunk", LatencyMode::Ultra, DiarStrategy::PerChunk),
+    ];
+    for (name, latency, diar) in configs {
+        knob_run("multitalker-0.6b-int8", name, true, |audio| {
+            let mut m = MultitalkerASR::from_pretrained(
+                multitalker_dir(),
+                sortformer_onnx(),
+                Some(execution_config()),
+            )
+            .map_err(|e| e.to_string())?;
+            m.set_latency_mode(latency);
+            m.set_diar_strategy(diar);
+            let mut buf = audio.to_vec();
+            peak_normalize(&mut buf);
+            let chunk = m.chunk_audio_samples();
+            let t0 = Instant::now();
+            for c in buf.chunks(chunk) {
+                let mut piece = c.to_vec();
+                piece.resize(chunk, 0.0);
+                m.transcribe_chunk(&piece).map_err(|e| e.to_string())?;
+            }
+            for _ in 0..3 {
+                m.transcribe_chunk(&vec![0.0; chunk]).map_err(|e| e.to_string())?;
+            }
+            if diar == DiarStrategy::Buffered {
+                m.flush().map_err(|e| e.to_string())?;
+            }
+            let secs = t0.elapsed().as_secs_f32();
+            let text = m
+                .get_transcripts()
+                .iter()
+                .map(|t| t.text.trim().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok((text, secs))
+        });
+    }
+}

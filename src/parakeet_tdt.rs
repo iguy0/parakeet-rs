@@ -2,7 +2,7 @@ use crate::audio::{self, FeatureCache};
 use crate::config::PreprocessorConfig;
 use crate::decoder::TranscriptionResult;
 use crate::decoder_tdt::ParakeetTDTDecoder;
-use crate::decoding::DecodingStrategy;
+use crate::decoding::{BeamConfig, DecodingStrategy};
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_tdt::ParakeetTDTModel;
@@ -19,6 +19,52 @@ pub struct ParakeetTDT {
     feature_cache: FeatureCache,
     model_dir: PathBuf,
     decoding: DecodingStrategy,
+    max_chunk_secs: Option<f32>,
+}
+
+/// Optional per-model defaults, read from the `parakeet_rs` object in the model directory's
+/// `config.json`:
+///
+/// ```json
+/// { "parakeet_rs": { "decoding": "greedy", "max_chunk_secs": 120 } }
+/// ```
+///
+/// `decoding` is `"greedy"` or `"beam"` and applies only to constructors that do not take an
+/// explicit [`DecodingStrategy`]. `max_chunk_secs` makes [`Transcriber::transcribe_samples`] split
+/// long audio at quiet points, because the FastConformer encoder fails past roughly 4-5 minutes
+/// per call. Missing file, object or keys keep the legacy behavior (greedy, no chunking).
+#[derive(Debug, Default, Clone, PartialEq)]
+struct TdtSidecar {
+    decoding: Option<DecodingStrategy>,
+    max_chunk_secs: Option<f32>,
+}
+
+impl TdtSidecar {
+    fn read(dir: &Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(dir.join("config.json")) else {
+            return Self::default();
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return Self::default();
+        };
+        let Some(obj) = json.get("parakeet_rs") else {
+            return Self::default();
+        };
+        let decoding = match obj.get("decoding").and_then(|v| v.as_str()) {
+            Some("greedy") => Some(DecodingStrategy::Greedy),
+            Some("beam") => Some(DecodingStrategy::Beam(BeamConfig::default_tdt())),
+            _ => None,
+        };
+        let max_chunk_secs = obj
+            .get("max_chunk_secs")
+            .and_then(|v| v.as_f64())
+            .filter(|v| *v > 0.0)
+            .map(|v| v as f32);
+        Self {
+            decoding,
+            max_chunk_secs,
+        }
+    }
 }
 
 impl ParakeetTDT {
@@ -32,7 +78,7 @@ impl ParakeetTDT {
         config: Option<ExecutionConfig>,
     ) -> Result<Self> {
         let joint_config = config.clone();
-        Self::from_pretrained_full(path, config, joint_config, DecodingStrategy::Greedy)
+        Self::from_pretrained_full(path, config, joint_config, None)
     }
 
     /// Load Parakeet TDT with an explicit decoding strategy (greedy default, or beam).
@@ -42,7 +88,7 @@ impl ParakeetTDT {
         decoding: DecodingStrategy,
     ) -> Result<Self> {
         let joint_config = config.clone();
-        Self::from_pretrained_full(path, config, joint_config, decoding)
+        Self::from_pretrained_full(path, config, joint_config, Some(decoding))
     }
 
     /// Load Parakeet TDT model from path, running the decoder/joint graph under its own execution
@@ -62,7 +108,7 @@ impl ParakeetTDT {
         config: Option<ExecutionConfig>,
         joint_config: Option<ExecutionConfig>,
     ) -> Result<Self> {
-        Self::from_pretrained_full(path, config, joint_config, DecodingStrategy::Greedy)
+        Self::from_pretrained_full(path, config, joint_config, None)
     }
 
     /// Load Parakeet TDT model from path, with an explicit decoder/joint execution
@@ -75,16 +121,20 @@ impl ParakeetTDT {
         joint_config: Option<ExecutionConfig>,
         decoding: DecodingStrategy,
     ) -> Result<Self> {
-        Self::from_pretrained_full(path, config, joint_config, decoding)
+        Self::from_pretrained_full(path, config, joint_config, Some(decoding))
     }
 
     fn from_pretrained_full<P: AsRef<Path>>(
         path: P,
         config: Option<ExecutionConfig>,
         joint_config: Option<ExecutionConfig>,
-        decoding: DecodingStrategy,
+        decoding: Option<DecodingStrategy>,
     ) -> Result<Self> {
         let path = path.as_ref();
+        let sidecar = TdtSidecar::read(path);
+        let decoding = decoding
+            .or(sidecar.decoding)
+            .unwrap_or(DecodingStrategy::Greedy);
 
         if !path.is_dir() {
             return Err(Error::Config(format!(
@@ -139,6 +189,7 @@ impl ParakeetTDT {
             feature_cache,
             model_dir: path.to_path_buf(),
             decoding,
+            max_chunk_secs: sidecar.max_chunk_secs,
         })
     }
 
@@ -150,6 +201,18 @@ impl ParakeetTDT {
         self.decoding = strategy;
     }
 
+    /// Longest audio (seconds) sent through the encoder in one call. `None` (default unless the
+    /// model's `config.json` sets `parakeet_rs.max_chunk_secs`) runs each clip in one call.
+    pub fn max_chunk_secs(&self) -> Option<f32> {
+        self.max_chunk_secs
+    }
+
+    /// Set or clear the chunk length used by `transcribe_samples`. Longer inputs are split at the
+    /// quietest 100 ms frame in the last 5 s of each window and the results are joined.
+    pub fn set_max_chunk_secs(&mut self, secs: Option<f32>) {
+        self.max_chunk_secs = secs.filter(|v| *v > 0.0);
+    }
+
     pub fn model_dir(&self) -> &Path {
         &self.model_dir
     }
@@ -159,13 +222,13 @@ impl ParakeetTDT {
     }
 }
 
-impl Transcriber for ParakeetTDT {
-    fn transcribe_samples(
+impl ParakeetTDT {
+    fn transcribe_one(
         &mut self,
         audio: Vec<f32>,
         sample_rate: u32,
         channels: u16,
-        mode: Option<TimestampMode>,
+        mode: TimestampMode,
     ) -> Result<TranscriptionResult> {
         let features = audio::extract_features_with_cache(
             audio,
@@ -186,12 +249,63 @@ impl Transcriber for ParakeetTDT {
         )?;
 
         // Apply timestamp mode conversion
-        let mode = mode.unwrap_or(TimestampMode::Tokens);
         result.tokens = process_timestamps(&result.tokens, mode);
 
         // Rebuild full text from processed tokens
         result.text = rebuild_text(&result.tokens, mode);
 
         Ok(result)
+    }
+}
+
+impl Transcriber for ParakeetTDT {
+    fn transcribe_samples(
+        &mut self,
+        audio: Vec<f32>,
+        sample_rate: u32,
+        channels: u16,
+        mode: Option<TimestampMode>,
+    ) -> Result<TranscriptionResult> {
+        let mode = mode.unwrap_or(TimestampMode::Tokens);
+        let window = self
+            .max_chunk_secs
+            .map(|secs| (secs * sample_rate as f32) as usize)
+            .filter(|w| *w > 0);
+        let frames = audio.len() / channels.max(1) as usize;
+        let Some(window) = window.filter(|w| frames > *w) else {
+            return self.transcribe_one(audio, sample_rate, channels, mode);
+        };
+
+        // Long input: down-mix, split at quiet points, transcribe each piece, shift timestamps.
+        let mono: Vec<f32> = if channels > 1 {
+            audio
+                .chunks_exact(channels as usize)
+                .map(|f| f.iter().sum::<f32>() / channels as f32)
+                .collect()
+        } else {
+            audio
+        };
+        let mut merged = TranscriptionResult {
+            text: String::new(),
+            tokens: Vec::new(),
+        };
+        let mut offset = 0usize;
+        while offset < mono.len() {
+            let remaining = &mono[offset..];
+            let mut end = audio::split_at_quiet_point(remaining, window, sample_rate);
+            if end == 0 || end > remaining.len() {
+                end = window.min(remaining.len());
+            }
+            let piece = self.transcribe_one(remaining[..end].to_vec(), sample_rate, 1, mode)?;
+            let shift = offset as f32 / sample_rate as f32;
+            merged.tokens.extend(piece.tokens.into_iter().map(|mut t| {
+                t.start += shift;
+                t.end += shift;
+                t
+            }));
+            offset += end;
+        }
+        merged.text = rebuild_text(&merged.tokens, mode);
+        Ok(merged)
     }
 }

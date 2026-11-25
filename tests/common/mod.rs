@@ -131,14 +131,11 @@ pub fn ctc_available() -> bool {
             .unwrap_or(false)
 }
 pub fn tdt_available() -> bool {
-    dir_has(
-        &tdt_dir(),
-        &[
-            "encoder-model.onnx",
-            "decoder_joint-model.onnx",
-            "vocab.txt",
-        ],
-    )
+    let d = tdt_dir();
+    d.join("vocab.txt").exists()
+        && (d.join("encoder-model.onnx").exists() || d.join("encoder-model.int8.onnx").exists())
+        && (d.join("decoder_joint-model.onnx").exists()
+            || d.join("decoder_joint-model.int8.onnx").exists())
 }
 pub fn unified_available() -> bool {
     dir_has(
